@@ -652,3 +652,5 @@ on the points below, and disagree with 0.3.17 on the ones marked FIXED.
   standing on a floor line with a halo, backgrounds full-bleed.
   Where a screenshot and a diagram disagree, trust the screenshot /
   Figs. 7–9.
+
+Work in progress.
