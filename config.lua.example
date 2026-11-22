@@ -1,0 +1,156 @@
+-- comic-chat-rs 0.3.10 — example config
+-- Version line: 0.3.x — this release is 0.3.10. Do NOT bump to 0.4 / 1.0.
+-- Patch increments only (0.3.10, 0.3.11, ...). The version in Cargo.toml
+-- and `VERSION` in src/main.rs are the single source of truth; CTCP
+-- VERSION replies `Open Comic Chat (Version 0.3.10)` from that constant.
+--
+-- LUA IS AUTHORITATIVE AND IMMUTABLE EXCEPT BY YOU.
+-- The GUI never writes this file. There is no Options window, no Servers
+-- editor, no Save button for settings. All usage is in the GUI (chat,
+-- connect, whisper, away, Save Conversation); all configuration is done
+-- exclusively here, in Lua, in a text editor. To change anything — nick,
+-- character, background, servers, theme, font, About logo, CTCP VERSION —
+-- edit this file and restart the program. Restart is required: the
+-- program reads config.lua once at startup and never re-reads it.
+--
+-- If this file does not exist at startup, the program creates it from
+-- this example (the same text as config.lua.example in the repo).
+-- If it fails to parse, the program keeps the file untouched, starts
+-- with defaults, and logs the error — fix the Lua and restart.
+--
+-- AVB/BGB live in ComicArt/ (flat, like C:\Program Files\Microsoft Chat\COMICART)
+-- PNG with same stem = preview for rendering. AVB/BGB = authoritative identity + URL.
+-- Style guide / history: the original Microsoft Comic Chat source is now
+-- MIT licensed at github.com/microsoft/comic-chat. This Rust client is
+-- clean-room, but its toolbar, balloons, panel rules, and Comic Sans
+-- default follow that source. We do NOT copy its BMP bitmaps or MFC
+-- code — our icons are SVGs (see icons note below).
+return {
+  me = { nick = "comicfan", username = "comicfan", realname = "Comic Chat RS" },
+  -- ui.font: the display font, as a FAMILY name — the `family:` value
+  -- fontconfig reports. NOT a filename, NOT a PostScript name:
+  --   family:         "Comic Sans MS"  <- put THIS in ui.font
+  --   file:           "/home/ryan/.fonts/Comic Sans MS/comic.ttf"  <- put THIS in ui.font_path, if you set it
+  --   postscriptname: "ComicSansMS"  <- NEVER put this in ui.font; it is not a family name
+  -- Default "Comic Sans MS". The original client drew everything in
+  -- Comic Sans (it shipped the font). This build does NOT bundle the
+  -- font (it is a Microsoft font, not MIT), so it loads a copy already
+  -- on this machine.
+  -- How the program finds the .ttf, in order:
+  --   1. ui.font_path, if set: that exact file, canonicalized (realpath).
+  --      It wins over everything below. It goes INSIDE the ui = { ... }
+  --      table, e.g. ui = { ..., font = "Comic Sans MS",
+  --      font_path = "/home/ryan/.fonts/Comic Sans MS/comic.ttf" }.
+  --      A leading ~/ is expanded to the home directory.
+  --   2. fc-list: runs `fc-list "Comic Sans MS" --format=%{file}:%{style}\n`
+  --      and reads the file fontconfig reports for that family (Regular
+  --      face preferred, so comic.ttf wins over comicbd.ttf Bold).
+  --      fc-list is used, NOT fc-match: fc-match substitutes a different
+  --      font when the family is absent, while fc-list returns nothing
+  --      unless the family really matches.
+  --   3. Hardcoded candidates: ~/.fonts/Comic Sans MS/comic.ttf,
+  --      ~/.local/share/fonts/Comic Sans MS/comic.ttf, flat
+  --      ~/.fonts/comic.ttf / ~/.local/share/fonts/comic.ttf, and the
+  --      system msttcorefonts locations under /usr/share/fonts/truetype/.
+  -- Only the regular face is loaded (comic.ttf, not comicbd.ttf Bold).
+  -- If nothing is found, egui's built-in default is used and a warning
+  -- is logged listing everything checked.
+  -- Set font = "default" to skip the search and always use egui's default.
+  -- Check your install:  fc-list | grep -i "comic sans"
+  -- See what the program will load:  fc-list "Comic Sans MS" --format=%{file}
+  --
+  -- About logo (Help > About):
+  -- By default the About window shows a drawn placeholder (program name
+  -- in a comic bubble). To show the original About bitmap instead,
+  -- reproduce it yourself from the MIT-licensed Microsoft repo:
+  --   1. Get the repo:  git clone https://github.com/microsoft/comic-chat
+  --      It preserves snapshots from a 1996 pre-release through the
+  --      2.5 beta, plus the SDK and docs. The About dialog lives in the
+  --      2.5 snapshot. Search that snapshot for the About dialog
+  --      resource / bitmap — that bitmap is the logo the original
+  --      About screen showed on the left.
+  --   2. Export / save that bitmap as a PNG or JPG, e.g.
+  --      comic-chat-about.png. Any PNG/JPG works — the About window
+  --      scales it to fit (max 180 px) and keeps the aspect ratio.
+  --      If you already have the bitmap as a .bmp, convert it:
+  --        convert about.bmp ~/Pictures/comic-chat-about.png
+  --      (ImageMagick) or open it in any image editor and Save As PNG.
+  --   3. Put the file somewhere stable, e.g.
+  --      ~/Pictures/comic-chat-about.png
+  --   4. Uncomment the about_logo line below and set it to that path.
+  --      A leading ~/ is expanded to your home directory, same as
+  --      ui.font_path. Absolute and relative paths also work.
+  --   5. Restart. Help > About now shows your image on the left,
+  --      with "Open Comic Chat / Version 0.3.10 / MIT License" on the right.
+  -- Do NOT ship the bitmap as your own — it is a Microsoft trademark,
+  -- MIT-licensed as part of the Microsoft repo. This project does not
+  -- bundle it, and the placeholder is the default for that reason.
+  -- If about_logo is unset, or the file cannot be read or decoded,
+  -- the placeholder is shown instead. No error dialog — the About
+  -- window still opens.
+  ui = {
+    scale = 1.0, panels_per_row = 0, theme = "light", show_text_log = true, font = "Comic Sans MS",
+    -- font_path = "/home/ryan/.fonts/Comic Sans MS/comic.ttf",
+    -- about_logo = "~/Pictures/comic-chat-about.png",
+  },
+  comic = {
+    messages_per_panel = 3, avatar_seed = 7,
+    character = "Frank",
+    -- character_url = "http://example.com/characters/Frank.AVB",
+    background = "Cafe",
+    -- background_url = "http://example.com/backgrounds/Cafe.BGB",
+    pose_style = "none", -- "none" = v2.5 sends no pose code (default), "old" = (#G090E090M1) legacy 1.0-2.1 only
+    auto_download = true,
+    show_pose_codes_in_text = true,
+    -- titles: custom room-entry title cards (the "Starring pane" — the
+    -- first panel on entering a room). These are ADDED on top of the
+    -- built-ins, not a replacement. Built-ins: JUST US CHUMPS, DEEPEST
+    -- DARKEST DESIRES, YOU SHOULDA BEEN THERE, NETWORKED NERDS. One is
+    -- picked at random on each room entry. Empty = built-ins only.
+    titles = {},
+    sound_path = "~/.config/comic-chat/Sounds",
+    -- CTCP VERSION override: when unset, a direct CTCP VERSION query is
+    -- answered with `Open Comic Chat (Version 0.3.10)` — the number is
+    -- concatenated from VERSION in src/main.rs, so it can never drift
+    -- from the release. When set, it replaces the WHOLE string, e.g. to
+    -- identify as another client or to hide the version:
+    -- ctcp_version = "Open Comic Chat (Version 2.5)",
+  },
+  -- debug_log: optional verbose debug log. OFF if absent (no file created).
+  -- Uncomment to enable: writes to ~/.config/comic-chat/debug.log by default.
+  -- debug_log = { enabled = true, level = "debug" }, -- level: error|warn|info|debug|trace, file = "/tmp/comic.log" optional
+  -- icons: override any UI icon SVG. Omit the whole table (or a key) to
+  -- use the built-in icons/<key>.svg. Every key maps to a real button
+  -- that does something observable and reports it (tooltip + status
+  -- line) — no icon is decoration. Full audit is in src/icons.rs.
+  -- Keys: connect, disconnect, say, think, whisper, action,
+  -- character, background, comic, text, save, copy, sound, send,
+  -- settings, refresh, members, announce, emotion-wheel, coffee, hammer.
+  -- Note: the GUI no longer has an Options window, so the "settings"
+  -- icon is unused by any button now, but the key is still accepted
+  -- (future use). The "character" / "background" icons are used by the
+  -- Share-background / Copy-background-as buttons in the side panel.
+  -- BRACKETS — READ THIS BEFORE OVERRIDING emotion-wheel:
+  -- Lua table keys that are not plain identifiers MUST use bracket
+  -- syntax. "emotion-wheel" contains a hyphen, so it MUST be written as
+  --   ["emotion-wheel"] = "icons/my-wheel.svg"
+  -- Bare `emotion-wheel = "icons/my-wheel.svg"` is parsed as
+  -- `emotion - wheel` (a subtraction) and the whole config FAILS to
+  -- load. All other keys are plain identifiers, so bare `say = ...`
+  -- is fine for them.
+  -- Examples (uncomment one to test):
+  -- icons = { say = "icons/my-say.svg", action = "/home/anon/icons/my-action.svg" },
+  -- icons = { ["emotion-wheel"] = "icons/my-wheel.svg" },
+  icons = {
+    -- say = "icons/my-say.svg",
+    -- action = "icons/my-action.svg",
+    -- ["emotion-wheel"] = "icons/my-wheel.svg",
+  },
+  servers = {
+    { name = "Libera", host = "irc.libera.chat", port = 6697, tls = true, channels = { "#libera" }, autoconnect = true },
+    -- { name = "Example", host = "irc.example.com", port = 6697, tls = true, nick = "comicfan", channels = { "#comic" }, autoconnect = false },
+    -- SASL (NickServ): uncomment and fill in to identify on connect:
+    -- { name = "Libera", host = "irc.libera.chat", port = 6697, tls = true, channels = { "#libera" }, sasl = { user = "comicfan", pass = "hunter2" }, autoconnect = true },
+  },
+}
+

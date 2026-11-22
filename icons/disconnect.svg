@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+<title>Disconnect — leave the room</title>
+<rect x="27" y="5" width="16" height="38" rx="2" fill="#9CA3AF" stroke="#1a1a1a" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="27,24 19,12 19,20 5,20 5,28 19,28 19,36" fill="#EF4444" stroke="#1a1a1a" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<line x1="33" y1="12" x2="40" y2="19" stroke="#EF4444" stroke-width="3" stroke-linecap="round"/>
+<line x1="40" y1="12" x2="33" y2="19" stroke="#EF4444" stroke-width="3" stroke-linecap="round"/>
+</svg>
+

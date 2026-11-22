@@ -1,0 +1,8 @@
+[package]
+name = "comic-balloon"
+version = "0.3.17"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+comic-geometry = { path = "../comic-geometry" }

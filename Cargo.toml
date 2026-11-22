@@ -1,0 +1,34 @@
+[package]
+name = "comic-chat-rs"
+version = "0.3.17"  # Version line: 0.3.x — do not bump to 0.4 / 1.0. Patch increments only (0.3.10, 0.3.11, ...).
+edition = "2021"
+description = "Microsoft Comic Chat reimagined: Rust + Lua config, Linux desktop, modern IRC with TLS, multi-server"
+license = "MIT"
+
+[dependencies]
+comic-geometry = { path = "crates/comic-geometry" }
+comic-text = { path = "crates/comic-text" }
+comic-avatar = { path = "crates/comic-avatar" }
+comic-balloon = { path = "crates/comic-balloon" }
+comic-panel = { path = "crates/comic-panel" }
+comic-protocol = { path = "crates/comic-protocol" }
+eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.27"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring", "logging", "tls12"] }
+webpki-roots = "0.26"
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
+serde = { version = "1", features = ["derive"] }
+rand = "0.8"
+dirs = "6.0"
+image = "0.25"
+flate2 = "1.0"
+
+[profile.release]
+opt-level = 2
+
+
+[workspace]
+members = ["crates/comic-geometry", "crates/comic-text", "crates/comic-avatar", "crates/comic-balloon", "crates/comic-panel", "crates/comic-protocol"]
+resolver = "2"

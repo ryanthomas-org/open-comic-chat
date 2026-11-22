@@ -1,0 +1,10 @@
+[package]
+name = "comic-avatar"
+version = "0.3.17"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+dirs = "6.0"
+image = "0.25"
+flate2 = "1.0"

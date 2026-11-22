@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Comic Chat
+Comment=Microsoft Comic Chat reimagined — IRC as automatically-generated comic strips
+Exec=comic-chat
+Icon=comic-chat
+Terminal=false
+Categories=Network;Chat;IRC;
+Keywords=IRC;chat;comic;comic chat;
+StartupWMClass=comic-chat-rs
+

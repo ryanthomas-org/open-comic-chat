@@ -1,0 +1,17 @@
+# Rust build output
+/target/
+
+# Local config (commit only config.lua.example)
+config.lua
+
+# Logs and chat history
+*.log
+
+# Editor / OS junk
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Environment / secrets
+.env
