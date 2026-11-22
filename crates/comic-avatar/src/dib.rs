@@ -90,6 +90,17 @@ pub struct DecodedAvb {
     pub poses: Vec<PoseEntry>, // POSE table; empty when AVB has no POSE chunk
 }
 
+/* ZLIB_HEADER_FIX 0317 */
+fn is_zlib_header(bytes: &[u8], i: usize) -> bool {
+    if i + 1 >= bytes.len() { return false; }
+    if bytes[i] != 0x78 { return false; }
+    let flg = bytes[i + 1] as u32;
+    // Valid zlib: (CMF*256+FLG) % 31 == 0, CM=8, no preset dict (FDICT bit clear)
+    if (0x78u32 * 256 + flg) % 31 != 0 { return false; }
+    if flg & 0x20 != 0 { return false; }
+    true
+}
+
 fn read_u16_le(b: &[u8], off: usize) -> Option<u16> {
     if off + 2 <= b.len() { Some(u16::from_le_bytes([b[off], b[off + 1]])) } else { None }
 }
@@ -516,7 +527,7 @@ fn decode_chunked_images_zlib_anchored(bytes: &[u8]) -> Vec<DibImage> {
     let mut out = Vec::new();
     let mut i = 6usize;
     while i + 2 <= bytes.len() {
-        if bytes[i] == 0x78 && matches!(bytes.get(i + 1), Some(0x01) | Some(0x5E) | Some(0x9C) | Some(0xDA)) {
+        if is_zlib_header(bytes, i) {
             if let Some((pixels, consumed)) = try_inflate_zlib(bytes, i) {
                 if !pixels.is_empty() {
                     // Find BMP header ending at i (allow up to 16 bytes gap for alignment).
@@ -646,6 +657,108 @@ fn decode_chunked_images(bytes: &[u8]) -> Vec<DibImage> {
     out
 }
 
+/// Parse real AVB typed gesture list -> unk1 pose codes in file order.
+/// Typed records: 0x0A (count + 25+8 bytes/entry), 0x0B/0x0C (count + 25 bytes/entry).
+/// unk1 at entry offset +12 (i16). Returns [] if not a typed AVB.
+fn parse_gesture_unk1_list(bytes: &[u8]) -> Vec<i16> {
+    if bytes.len() < 2 || read_u16_le(bytes, 0) != Some(0x8181) { return Vec::new(); }
+    let mut off = 0usize;
+    let mut out = Vec::new();
+    while off + 2 <= bytes.len() {
+        let ty = match read_u16_le(bytes, off) { Some(v) => v, None => break };
+        off += 2;
+        match ty {
+            0x8181 => { off += 4; }
+            1 => { match bytes[off..].iter().position(|&b| b == 0) { Some(n) => { off += n + 1; } None => break, } }
+            2 | 8 => { off += 2; }
+            0x0A => {
+                let cnt = match read_u16_le(bytes, off) { Some(v) => v as usize, None => break };
+                off += 2;
+                for _ in 0..cnt {
+                    if off + 25 > bytes.len() { break; }
+                    if let Some(v) = read_u16_le(bytes, off + 12) { out.push(v as i16); }
+                    off += 25 + 8;
+                }
+            }
+            0x0B | 0x0C => {
+                let cnt = match read_u16_le(bytes, off) { Some(v) => v as usize, None => break };
+                off += 2;
+                for _ in 0..cnt {
+                    if off + 25 > bytes.len() { break; }
+                    if let Some(v) = read_u16_le(bytes, off + 12) { out.push(v as i16); }
+                    off += 25;
+                }
+            }
+            0x100 => { off += 8; }
+            0x103 | 0x104 | 0x105 | 0x106 => {
+                let sz = match read_u16_le(bytes, off) { Some(v) => v as usize, None => break };
+                off += 2 + sz;
+            }
+            0x107 => { off += 6; }
+            6 => { break; }
+            _ => { break; }
+        }
+    }
+    out
+}
+
+/* GESTURE_DEDUP_FIX 0317 */
+/// Parse gesture list offsets (u32 @0 in each 0x0C entry) in file order.
+/// Two gestures can share the same offset = same sprite reused for two poses.
+/// Returns [] if not a typed AVB. Length should equal parse_gesture_unk1_list len.
+fn parse_gesture_offsets(bytes: &[u8]) -> Vec<u32> {
+    if bytes.len() < 2 || read_u16_le(bytes, 0) != Some(0x8181) { return Vec::new(); }
+    let mut off = 0usize;
+    let mut out = Vec::new();
+    while off + 2 <= bytes.len() {
+        let ty = match read_u16_le(bytes, off) { Some(v) => v, None => break };
+        off += 2;
+        match ty {
+            0x8181 => { off += 4; }
+            1 => { match bytes[off..].iter().position(|&b| b == 0) { Some(n) => { off += n + 1; } None => break, } }
+            2 | 8 => { off += 2; }
+            0x0A => {
+                let cnt = match read_u16_le(bytes, off) { Some(v) => v as usize, None => break };
+                off += 2;
+                for _ in 0..cnt {
+                    if off + 25 > bytes.len() { break; }
+                    if let Some(v) = read_u32_le(bytes, off) { out.push(v); }
+                    off += 25 + 8;
+                }
+            }
+            0x0B | 0x0C => {
+                let cnt = match read_u16_le(bytes, off) { Some(v) => v as usize, None => break };
+                off += 2;
+                for _ in 0..cnt {
+                    if off + 25 > bytes.len() { break; }
+                    if let Some(v) = read_u32_le(bytes, off) { out.push(v); }
+                    off += 25;
+                }
+            }
+            0x100 => { off += 8; }
+            0x103 | 0x104 | 0x105 | 0x106 => {
+                let sz = match read_u16_le(bytes, off) { Some(v) => v as usize, None => break };
+                off += 2 + sz;
+            }
+            0x107 => { off += 6; }
+            6 => { break; }
+            _ => { break; }
+        }
+    }
+    out
+}
+
+/// Map unk1 -> (gesture, expression) matching app.rs face_index/gesture_index.
+/// 1=Happy(0,1) 2=Coy(0,2) 3=Bored(0,3) 4=Scared(0,4) 5=Sad(0,5) 6=Angry(0,6) 7=Shout(0,7) 8=Laugh(0,8) 9=Neutral(0,0) 10=Wave(1,1) 11=PointOther(3,0) 12=PointSelf(2,0)
+fn unk1_to_pose(unk1: i16) -> (u8, u8) {
+    match unk1 {
+        1 => (0, 1), 2 => (0, 2), 3 => (0, 3), 4 => (0, 4), 5 => (0, 5),
+        6 => (0, 6), 7 => (0, 7), 8 => (0, 8), 9 => (0, 0),
+        10 => (1, 1), 11 => (3, 0), 12 => (2, 0),
+        _ => (0, 0),
+    }
+}
+
 pub fn decode_avb_bytes(bytes: &[u8], path: &Path) -> Option<DecodedAvb> {
     crate::log::debug("dib", format!("decode_avb_bytes: {} — {} bytes, first byte 0x{:02x}, version byte {}", path.display(), bytes.len(), bytes.first().copied().unwrap_or(0), bytes.get(4).copied().unwrap_or(0)));
     if bytes.len() < 6 || bytes[0] != 0x81 { crate::log::warn("dib", format!("decode_avb_bytes: {} failed header check (len={} first=0x{:02x}) — not an AVB/BGB, no DIBs will be decoded", path.display(), bytes.len(), bytes.first().copied().unwrap_or(0))); return None; }
@@ -686,13 +799,14 @@ pub fn decode_avb_bytes(bytes: &[u8], path: &Path) -> Option<DecodedAvb> {
     if chunked.is_empty() { chunked = decode_chunked_images(bytes); }
     let mut raw: Vec<DibImage> = chunked;
     if raw.is_empty() {
+
     // 2) Fallback: raw scan for zlib streams + raw BM BMPs (v2.1, and
     // files whose chunked header does not walk cleanly).
     // Collect raw DIBs: zlib streams + raw BM BMPs
     let mut i = 0usize;
     while i + 2 <= bytes.len() {
         // zlib header: 0x78 01 / 5E / 9C / DA
-        if bytes[i] == 0x78 && matches!(bytes.get(i + 1), Some(0x01) | Some(0x5E) | Some(0x9C) | Some(0xDA)) {
+        if is_zlib_header(bytes, i) {
             if let Some((inflated, consumed)) = try_inflate_zlib(bytes, i) {
                 // Inflated payload should start with BITMAPINFOHEADER (40) or COREHEADER (12)
                 if inflated.len() >= 12 {
@@ -802,7 +916,40 @@ pub fn decode_avb_bytes(bytes: &[u8], path: &Path) -> Option<DecodedAvb> {
     if images.is_empty() {
         crate::log::warn("dib", format!("decode_avb_bytes: {} decoded 0 images — file may be a stub (like the bundled Frank.AVB 24-byte placeholder) or use an unsupported bit depth/compression. Rendering will fall back to PNG sidecar.", path.display()));
     }
-    let poses = parse_pose_table(bytes);
+    let mut poses = parse_pose_table(bytes);
+    if poses.is_empty() {
+        let unk1s = parse_gesture_unk1_list(bytes);
+        if !unk1s.is_empty() {
+            // GESTURE_DEDUP_FIX: gestures can share an image offset (Trekkie 01/02,
+            // 14/15). Map by offset, not by index. Unique offsets in first-seen
+            // order correspond to images[] in scan order (file order), plus an
+            // optional icon at images[0] if images.len() == unique.len() + 1.
+            let offsets = parse_gesture_offsets(bytes);
+            if offsets.len() == unk1s.len() {
+                let mut unique: Vec<u32> = Vec::new();
+                for &o in offsets.iter() {
+                    if !unique.contains(&o) { unique.push(o); }
+                }
+                let base = if images.len() == unique.len() + 1 { 1usize } else { 0usize };
+                for (i, unk1) in unk1s.iter().enumerate() {
+                    let uidx = unique.iter().position(|&u| u == offsets[i]).unwrap_or(i);
+                    let img_idx = base + uidx;
+                    if img_idx >= images.len() { break; }
+                    let (g, e) = unk1_to_pose(*unk1);
+                    poses.push(PoseEntry { gesture: g, expression: e, image_index: img_idx });
+                }
+            } else {
+                // Fallback: old 1:1 mapping if offsets don't match (should not happen)
+                let offset = if images.len() == unk1s.len() + 1 { 1 } else { 0 };
+                for (i, unk1) in unk1s.iter().enumerate() {
+                    let img_idx = i + offset;
+                    if img_idx >= images.len() { break; }
+                    let (g, e) = unk1_to_pose(*unk1);
+                    poses.push(PoseEntry { gesture: g, expression: e, image_index: img_idx });
+                }
+            }
+        }
+    }
     Some(DecodedAvb { name, url, version, images, raw_dibs: raw, face_anchor, mouth_anchor, bg_image, poses})
 }
 

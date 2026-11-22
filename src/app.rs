@@ -1361,7 +1361,9 @@ ch.title_pending = false;
         if let Some(avb) = self.avb_chars.iter().find(|f| f.name.eq_ignore_ascii_case(name)) {
             if let Some(dec) = crate::dib::decode_avb_file(&avb.path) {
                 if !dec.images.is_empty() {
+                    crate::log::debug("app", format!("char_pose_texture: {name:?} emotion={emotion:?} gesture={gesture:?} images={} raw_dibs={} poses={:?}", dec.images.len(), dec.raw_dibs.len(), dec.poses));
                     let idx = Self::pose_image_index_seeded(dec.images.len(), emotion, gesture, msg_seed, &dec.poses);
+                    crate::log::debug("app", format!("char_pose_texture: {name:?} picked idx={idx} for emotion={emotion:?} gesture={gesture:?}"));
                     let img = &dec.images[idx.min(dec.images.len() - 1)];
                     let pixels: Vec<Color32> = img.rgba.chunks_exact(4).map(|p| Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])).collect();
                     let cimg = ColorImage { size: [img.width as usize, img.height as usize], pixels };

@@ -4,12 +4,20 @@
 //!
 //! File formats (authoritative, from the Microsoft source + observed files):
 //!
-//! AVB (avatar, v2.5): a chunked file. Each chunk is
-//!   `[4-byte tag][u32 little-endian length][payload]`.
-//!   Known tags: `AVB ` / header, `DIB ` (one DIB image per pose part),
-//!   `POSE` (pose table), `FACE` (face/mouth anchor table), `NAME`,
-//!   `DESC`. Unknown tags MUST be skipped by length, not treated as error.
-//!   0.3.17 src/avb.rs treated an unknown tag as fatal — wrong.
+//! AVB (avatar, v2.5): TYPED records, NOT `[tag][len][payload]` chunks.
+//!   Verified against Trekkie2018.AVB + AVBuster + MS avatar.h:
+//!   File = sequence of `u16 type` records: 0x8181 header, 1=name,
+//!   2/8=unk, 0x0A/0x0B/0x0C=gesture list (count + 25-byte entries),
+//!   0x100/0x103/0x104/0x105/0x106/0x107=strings + zlibOffset, 6=end.
+//!   Gesture entry (25 bytes): i32 gestureOffset, i32 unknownOffset,
+//!   i32 poseOffset, i16 unk1=POSE CODE, 4 bytes face (bytes 15,17 = x,y),
+//!   i16 unk2==256, i16 unk3==257, i16 unk4==770, u8 unk5==3.
+//!   BMP at gestureOffset+zlibOffset: gesture hdr (3x u16) + palette
+//!   (num_colors*3 RGB) + BITMAPINFOHEADER + len_decomp/len_comp + zlib data.
+//!   unk1: 1=Happy, 2=Coy, 3=Bored, 4=Scared, 5=Sad, 6=Angry, 7=Shout,
+//!   8=Laugh, 9=Neutral, 10=Wave, 11=Point, 12=Gesture.
+//!   Trekkie2018.AVB 27 entries, Coy = entries 16,24,25.
+//!   Old chunk parser kept as fallback for synthetic test files only.
 //!
 //! BGB (background): same chunk framing; payload is a single DIB (the
 //!   background image) plus `BGND` / size chunks. BGB loads where AVB
@@ -199,10 +207,144 @@ impl Avatar {
     }
 }
 
+/// Map AVB unk1 pose code to (gesture, expression) for PoseEntry.
+fn unk1_to_pose(unk1: i16) -> (u8, u8) {
+    match unk1 {
+        1 => (0, 1),
+        2 => (0, 2),
+        3 => (0, 3),
+        4 => (0, 4),
+        5 => (0, 5),
+        6 => (0, 6),
+        7 => (0, 7),
+        8 => (0, 8),
+        9 => (0, 0),
+        10 => (1, 1),
+        11 => (2, 0),
+        12 => (3, 0),
+        _ => (0, 0),
+    }
+}
+
+/// Decode one AVB gesture BMP at data[pos..] (gestureOffset+zlibOffset).
+fn decode_avb_gesture_bmp(data: &[u8], pos: usize) -> Result<RgbaImage, AvatarError> {
+    if pos + 6 > data.len() { return Err(AvatarError::Truncated); }
+    let ncolors = le_u16(&data[pos+4..pos+6]) as usize;
+    let mut p = pos + 6;
+    let mut palette: Vec<[u8;4]> = Vec::new();
+    for _ in 0..ncolors {
+        if p + 3 > data.len() { return Err(AvatarError::Truncated); }
+        palette.push([data[p], data[p+1], data[p+2], 255]);
+        p += 3;
+    }
+    if p + 48 > data.len() { return Err(AvatarError::Truncated); }
+    let w_i = le_i32(&data[p+4..p+8]);
+    let h_i = le_i32(&data[p+8..p+12]);
+    let bpp = le_u16(&data[p+14..p+16]);
+    let comp = le_u32(&data[p+16..p+20]);
+    if comp != 0 { return Err(AvatarError::UnsupportedCompression(comp)); }
+    if w_i <= 0 || h_i == 0 { return Err(AvatarError::BadHeader); }
+    let w = w_i as u32; let h = h_i.unsigned_abs(); let top_down = h_i < 0;
+    let len_decomp = le_i32(&data[p+40..p+44]) as usize;
+    let len_comp = le_i32(&data[p+44..p+48]) as usize;
+    p += 48;
+    if p + len_comp > data.len() { return Err(AvatarError::Truncated); }
+    let raw = inflate_zlib(&data[p..p+len_comp])?;
+    if raw.len() < len_decomp { return Err(AvatarError::Truncated); }
+    let row_bits = w as usize * bpp as usize;
+    let stride = ((row_bits + 31) / 32) * 4;
+    let mut img = RgbaImage::new(w, h);
+    while palette.len() < 256 { palette.push([0,0,0,255]); }
+    for row in 0..h as usize {
+        let src_row = if top_down { row } else { h as usize - 1 - row };
+        let row_off = src_row * stride;
+        if row_off >= raw.len() { break; }
+        for x in 0..w as usize {
+            let px: [u8;4] = match bpp {
+                8 => { let o = row_off + x; if o >= raw.len() { continue; } palette[raw[o] as usize] }
+                4 => { let o = row_off + x/2; if o >= raw.len() { continue; } let nib = if x%2==0 { raw[o]>>4 } else { raw[o]&0x0F }; palette[nib as usize] }
+                1 => { let o = row_off + x/8; if o >= raw.len() { continue; } let bit = 7-(x%8); let idx = (raw[o]>>bit)&1; palette[idx as usize] }
+                24 => { let o = row_off + x*3; if o+3 > raw.len() { continue; } [raw[o+2], raw[o+1], raw[o], 255] }
+                32 => { let o = row_off + x*4; if o+4 > raw.len() { continue; } [raw[o+2], raw[o+1], raw[o], raw[o+3]] }
+                _ => return Err(AvatarError::UnsupportedBpp(bpp)),
+            };
+            img.set(x as u32, row as u32, px);
+        }
+    }
+    Ok(img)
+}
+
+/// Parse REAL AVB typed format. Returns None if not typed AVB.
+fn parse_avb_typed(data: &[u8]) -> Option<Result<Avatar, AvatarError>> {
+    if data.len() < 2 || le_u16(&data[0..2]) != 0x8181 { return None; }
+    let mut off = 0usize;
+    let mut name = String::new();
+    let mut zlib_off: i32 = 11;
+    let mut gestures: Vec<(i32, i16, (i32, i32))> = Vec::new();
+    while off + 2 <= data.len() {
+        let t = le_u16(&data[off..off+2]); off += 2;
+        match t {
+            0x8181 => { if off+4 > data.len() { return Some(Err(AvatarError::Truncated)); } off += 4; }
+            1 => { match data[off..].iter().position(|&c| c==0) { Some(n) => { name = String::from_utf8_lossy(&data[off..off+n]).into_owned(); off += n+1; } None => return Some(Err(AvatarError::Truncated)), } }
+            2 => { off += 2; }
+            8 => { off += 2; }
+            0x0A => {
+                if off+2 > data.len() { return Some(Err(AvatarError::Truncated)); }
+                let cnt = le_u16(&data[off..off+2]) as usize; off += 2;
+                for _ in 0..cnt {
+                    if off+25+8 > data.len() { return Some(Err(AvatarError::Truncated)); }
+                    let go = le_i32(&data[off..off+4]);
+                    let unk1 = le_u16(&data[off+12..off+14]) as i16;
+                    let face = (data[off+15] as i32, data[off+17] as i32);
+                    gestures.push((go, unk1, face));
+                    off += 25 + 8;
+                }
+            }
+            0x0B | 0x0C => {
+                if off+2 > data.len() { return Some(Err(AvatarError::Truncated)); }
+                let cnt = le_u16(&data[off..off+2]) as usize; off += 2;
+                for _ in 0..cnt {
+                    if off+25 > data.len() { return Some(Err(AvatarError::Truncated)); }
+                    let go = le_i32(&data[off..off+4]);
+                    let unk1 = le_u16(&data[off+12..off+14]) as i16;
+                    let face = (data[off+15] as i32, data[off+17] as i32);
+                    gestures.push((go, unk1, face));
+                    off += 25;
+                }
+            }
+            0x100 => { off += 8; }
+            0x103 | 0x104 | 0x105 => {
+                if off+2 > data.len() { return Some(Err(AvatarError::Truncated)); }
+                let sz = le_u16(&data[off..off+2]) as usize; off += 2; off += sz;
+            }
+            0x106 => { if off+2 > data.len() { return Some(Err(AvatarError::Truncated)); } let sz = le_u16(&data[off..off+2]) as usize; off += 2; off += sz; }
+            0x107 => { if off+6 > data.len() { return Some(Err(AvatarError::Truncated)); } off += 2; zlib_off = le_i32(&data[off..off+4]); off += 4; }
+            6 => { break; }
+            _ => { break; }
+        }
+    }
+    if gestures.is_empty() { return Some(Err(AvatarError::BadChunk)); }
+    let mut images = Vec::new();
+    let mut poses = Vec::new();
+    let mut face_anchors = HashMap::new();
+    for (go, unk1, face) in gestures.iter() {
+        let pos = (*go as usize).saturating_add(zlib_off as usize);
+        if let Ok(img) = decode_avb_gesture_bmp(data, pos) {
+            face_anchors.insert(images.len(), *face);
+            images.push(img);
+            let (g, e) = unk1_to_pose(*unk1);
+            poses.push(PoseEntry { gesture: g, expression: e, image_index: images.len()-1 });
+        }
+    }
+    if images.is_empty() { return Some(Err(AvatarError::Truncated)); }
+    Some(Ok(Avatar { name, images, poses, face_anchors, mouth_images: HashMap::new() }))
+}
+
 /// Parse an AVB file (chunk stream) into an Avatar.
 /// DIB chunks become images in order; POSE chunks are parsed as
 /// triplets (gesture u8, expression u8, image_index u16 LE).
 pub fn load_avb(data: &[u8]) -> Result<Avatar, AvatarError> {
+    if let Some(r) = parse_avb_typed(data) { return r; }
     let chunks = read_chunks(data)?;
     let mut images = Vec::new();
     let mut poses = Vec::new();

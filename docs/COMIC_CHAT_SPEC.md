@@ -14,6 +14,7 @@
 **Authority rule:** Where Part B differs from Part A or from the code Part A is based on, Part A and the `crates/` libraries win. Part B is contextualisation, not correction. If a Part A detail is found wrong against the Microsoft source, fix the library first, then this spec — never the reverse.
 
 **Sources for Part A:** Direct analysis of the Microsoft Chat MIT-licensed open-source code (C++ / MFC Comic Chat client): `chat.cpp`, `chatdoc.cpp`, `panel.cpp/.h`, `avatar.cpp/.h`, `bodycam.cpp/.h`, `balloon.cpp/.h`, `arc.cpp`, `traj.cpp`, `spline.cpp`, `vector2d.cpp/.h`, `textpose.cpp`, `textview.cpp/.h`, `semantic.cpp`, `format` / `chatprot`, `ircproto.h`, `ircsock.cpp`, `protsupp.cpp`, `userinfo.cpp/.h`, `histent.cpp/.h`, `pageview.cpp`, DIB / AVB loader, `chatver.h`, `bbox.h`, `pe.h` — plus the Rust rewrites in `crates/` in this bundle, which codify the same findings. Every claim in Part A traces to one of those two. Claims in Part B are marked as supplemented.
+Real AVB (verified Trekkie2018.AVB, 27 gestures in 0x0C list) is typed u16 records, not [tag][len] chunks; no POSE chunk exists - pose code is gesture entry unk1 (bytes 12-13): 1=Happy, 2=Coy, 3=Bored, 4=Scared, 5=Sad, 6=Angry, 7=Shout, 8=Laugh, 9=Neutral, 10=Wave, 11=Point, 12=Gesture; face anchor is bytes 15/17; falling back by DIB order showed Happy for Coy.
 
 **How to read this document:** §1–§9 are Part A (authoritative, code-derived). §10 is the assessment of the existing `comic-chat-rs 0.3.17` file set and the changes needed. §11–§16 are Part B (supplemented full-spec material). Appendix A is the file / symbol map. Appendix B lists what was *not* established by the code analysis and must be re-checked against the Microsoft source before being relied on.
 
@@ -157,6 +158,8 @@ untrusted too. Re-derive the `E` digit mapping from `textpose.cpp` / `avatar.h` 
 Microsoft open-source tree before relying on it for wire encode / decode. Until then,
 treat `E` digits as opaque in the spec, and keep `PoseCode` encode/decode covered by
 tests against captured real-client bytes, not by this paragraph.
+
+**CORRECTED-2026-11-21 — verified against live MS Chat 2.5 + Trekkie2018 AVB PoseEntry table:** OldAngle `(#G045E000M1)` is NOT parsed by MS Chat 2.5 — it falls back to Neutral, while this client parsed it locally, so local showed Coy/Wave and MS Chat showed Neutral. Canonical v2.5 `(#G<g>:1E<e>:1M1)` IS parsed. `E` = face_index, `G` = torso_index, same indices local rendering uses for `PoseEntry`: E Neutral 0, Happy 1, Coy 2, Bored 3, Scared 4, Sad 5, Angry 6, Shout 7, Laugh 8 / G Neutral 0, Wave 1, PointSelf 2, PointOther 3, DoublePoint 4, Shrug 5, Walk3Q 6, SideWalk 7, Walk3QF 8. Neutral/Neutral sends no code. `Contemptuous` / `Disgusted` / `Surprised` / `Afraid` are NOT MS Chat emotions — the `comic-text` crate table using them mis-maps E2 (Coy) as Sad and drops E8 (Laugh); parse E digit directly as face_index, do not go through that table.
 
 ### 3.3 `Appears as` / `Background as`
 

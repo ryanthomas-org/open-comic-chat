@@ -108,10 +108,71 @@ pub fn canonical_wire_for(emotion: Emotion, gesture: Gesture) -> String {
 /// local PoseCode shape. Returns None when no leading canonical code is
 /// present (old-angle codes are handled by the fallback in parse_pose_code).
 /// Intensity is 1.0: the wire intensity digit is 1 for user-selected poses.
+fn emotion_from_face_index(d: u8) -> Option<Emotion> {
+    match d {
+        0 => Some(Emotion::Neutral),
+        1 => Some(Emotion::Happy),
+        2 => Some(Emotion::Coy),
+        3 => Some(Emotion::Bored),
+        4 => Some(Emotion::Scared),
+        5 => Some(Emotion::Sad),
+        6 => Some(Emotion::Angry),
+        7 => Some(Emotion::Shout),
+        8 => Some(Emotion::Laugh),
+        _ => None,
+    }
+}
+fn gesture_from_torso_index(d: u8) -> Option<Gesture> {
+    match d {
+        0 => Some(Gesture::Neutral),
+        1 => Some(Gesture::Wave),
+        2 => Some(Gesture::PointSelf),
+        3 => Some(Gesture::PointOther),
+        4 => Some(Gesture::DoublePoint),
+        5 => Some(Gesture::Shrug),
+        6 => Some(Gesture::Walk3Q),
+        7 => Some(Gesture::SideWalk),
+        8 => Some(Gesture::Walk3QF),
+        _ => None,
+    }
+}
 fn parse_canonical_leading(text: &str) -> Option<(String, PoseCode)> {
+    // Parse E/G digits directly as face/torso indices (0..8). Do NOT go
+    // through comic_text::Emotion — its table is the old wrong set
+    // (Surprised/Afraid/Disgusted/Contemptuous, 0..7) and collapses
+    // Shout->Angry, Laugh->Happy, Coy->E7, so real MS Chat E2 (Coy)
+    // parsed as Sad and E8 (Laugh) failed entirely.
     let (wire_pose, rest) = comic_text::parse_pose_code(text)?;
-    let emotion = wire_emotion_to_local(wire_pose.emotion);
+    // Re-extract the E digit from the raw wire prefix — comic_text has
+    // already validated the shape, we just need the digit it mis-mapped.
+    let trimmed = text.trim_start();
+    let end = trimmed.find(')')?;
+    let inner = &trimmed[2..end];
+    let mut e_digit: Option<u8> = None;
+    for part in inner.split(':') {
+        if let Some(e_pos) = part.find('E') {
+            let digits: String = part[e_pos + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(d) = digits.parse::<u8>() {
+                e_digit = Some(d);
+            }
+        }
+    }
+    let emotion = e_digit.and_then(emotion_from_face_index).unwrap_or_else(|| wire_emotion_to_local(wire_pose.emotion));
     let gesture = wire_gesture_to_local(wire_pose.gesture);
+    // Gesture digits are already correct via wire_gesture_to_local (G1=Wave
+    // etc.), but keep the direct path as the source of truth if present.
+    let gesture = {
+        let mut g_digit: Option<u8> = None;
+        for part in inner.split(':') {
+            let pp = part.trim();
+            if pp.starts_with('G') {
+                if let Ok(d) = pp[1..].parse::<u8>() {
+                    g_digit = Some(d);
+                }
+            }
+        }
+        g_digit.and_then(gesture_from_torso_index).unwrap_or(gesture)
+    };
     let pose = PoseCode::from_emotion_gesture(emotion, gesture, 1.0);
     Some((rest.to_string(), pose))
 }
@@ -150,11 +211,31 @@ impl PoseCode {
     pub fn to_old_angle_string(&self) -> String {
         format!("(#G{:03}E{:03}M1)", gesture_to_angle(self.gesture), emotion_to_angle(self.emotion))
     }
-    /// Wire string for a pose_style: "old"/"legacy" -> OldAngle, anything else ("none") -> "".
+    /// Canonical v2.5 wire form: "(#G<g>:1E<e>:1M1)" using the SAME
+    /// face_index / torso_index the local renderer uses for PoseEntry
+    /// (Neutral 0, Happy 1, Coy 2, Bored 3, Scared 4, Sad 5, Angry 6,
+    /// Shout 7, Laugh 8 / Neutral 0, Wave 1, PointSelf 2, PointOther 3,
+    /// DoublePoint 4, Shrug 5, Walk3Q 6, SideWalk 7, Walk3QF 8).
+    /// Neutral/Neutral -> "" (v2.5 PoseStyle::None: plain message sends
+    /// no pose code). Coy+Neutral -> "(#G0:1E2:1M1)", Neutral+Wave
+    /// ("hello") -> "(#G1:1E0:1M1)".
+    pub fn to_canonical_string(&self) -> String {
+        if self.face_index == 0 && self.torso_index == 0 {
+            return String::new();
+        }
+        format!("(#G{}:1E{}:1M1)", self.torso_index, self.face_index)
+    }
+    /// Wire string for a pose_style: "old-angle"/"legacy"/"1.0" -> OldAngle
+    /// (1.0-2.1 only), "none" -> "" (explicitly no codes), anything else
+    /// (including "old" — the previous default — "", "canonical", "v2.5")
+    /// -> canonical v2.5. "old" previously meant OldAngle, which MS Chat
+    /// 2.5 does not parse (it falls back to Neutral); it now means
+    /// "send pose codes" in the form 2.5 understands.
     pub fn to_wire_string(&self, pose_style: &str) -> String {
         match pose_style.trim().to_ascii_lowercase().as_str() {
-            "old" | "legacy" => self.to_old_angle_string(),
-            _ => String::new(),
+            "old-angle" | "legacy" | "1.0" | "1.0-2.1" | "2.1" => self.to_old_angle_string(),
+            "none" => String::new(),
+            _ => self.to_canonical_string(),
         }
     }
     pub fn emotion(&self) -> Emotion { self.emotion }
@@ -604,10 +685,20 @@ mod cleanup_0317_pose_state {
     #[test]
     fn wire_string_dispatch() {
         let pose = PoseCode::from_emotion_gesture(Emotion::Happy, Gesture::Wave, 1.0);
-        assert_eq!(pose.to_wire_string("old"), "(#G045E350M1)");
+        // "old" (previous default) now means canonical v2.5, not OldAngle —
+        // MS Chat 2.5 does not parse OldAngle, it falls back to Neutral.
+        assert_eq!(pose.to_wire_string("old"), "(#G1:1E1:1M1)");
+        assert_eq!(pose.to_wire_string(""), "(#G1:1E1:1M1)");
+        assert_eq!(pose.to_wire_string("canonical"), "(#G1:1E1:1M1)");
         assert_eq!(pose.to_wire_string("legacy"), "(#G045E350M1)");
+        assert_eq!(pose.to_wire_string("old-angle"), "(#G045E350M1)");
         assert_eq!(pose.to_wire_string("none"), "");
-        assert_eq!(pose.to_wire_string(""), "");
+        // Neutral/Neutral -> no code in canonical (v2.5 PoseStyle::None).
+        let neutral = PoseCode::from_emotion_gesture(Emotion::Neutral, Gesture::Neutral, 1.0);
+        assert_eq!(neutral.to_wire_string("old"), "");
+        assert_eq!(neutral.to_wire_string(""), "");
+        assert_eq!(neutral.to_wire_string("canonical"), "");
+        assert_eq!(neutral.to_wire_string("none"), "");
     }
 }
 
