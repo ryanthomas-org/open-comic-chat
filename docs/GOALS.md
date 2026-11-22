@@ -98,3 +98,17 @@ After every change: check the box above, move the item to Done with date, and if
 rule changed, update `COMIC_CHAT_SPEC.md` in the same commit / patch. If a goal is
 found wrong against the Microsoft source, fix the spec first, then this file.
 Do not silently patch either file.
+
+## Pertinent info from old README
+
+- Version locked to 0.3.17. Do not bump without explicit consent. Cargo.toml and src/version.rs are the single source of truth.
+- Config: Lua-only, at ~/.config/comic-chat/config.lua. No config controls in GUI.
+- Character = AVB file, Background = BGB file. ComicArt/ is authoritative. AVB/BGB carry Name + embedded URL.
+- Pose wire: code goes at the beginning of every message to communicate expression. Never send pose="" and claim a pose was sent. Preview must show exactly the pose that will be sent.
+- Pose inference: text first, wheel override second. I at sentence start points to self, you points to other, ALL CAPS shouts. Emoticons, LOL / ROTFL laugh.
+- Balloon: closed B-spline around text block plus margin, outward-only displacement, no inward dips. Short text must come out near-circular by construction, not by tuning corner radius. Rounded rect + wobble is not the target.
+- Avatar: 1-2 chars torso-up to frame edge, 3+ full-body, square panel, tail to head, no nick label under avatar, nick only on hover, character stands on panel not below it.
+- Panels: 5-char cap, one balloon per character per panel, balloons in a row above characters, tails to speaker.
+- Fonts: UI Comic Sans MS Regular, balloons Comic Sans MS Bold by default, without editing config.
+- Away: standard AWAY + CTCP AWAY to every channel, coffee cup next to nick, private CTCP AWAY to joiners while away.
+- Appears-as: Appears as Name.URL on join and on announce. Background-as same shape.
