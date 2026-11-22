@@ -685,6 +685,17 @@ ch.title_pending = false;
                     // before the mutable borrow of self.servers below.
                     let my = self.my_nick_for(&server);
                     if let Some(s) = self.servers.get_mut(&server) {
+                        // Private AppearsAs (PRIVMSG <our nick> :# Appears as ...) arrives with
+                        // channel == our nick, not #garage. Mirror it into every joined channel
+                        // on this server so existing users get a character in #garage, not a silhouette.
+                        if channel.eq_ignore_ascii_case(&my) {
+                            let targets: Vec<String> = s.channels.keys().cloned().collect();
+                            for tc in targets {
+                                if let Some(och) = s.channels.get_mut(&tc) {
+                                    och.char_map.insert(nick.clone(), (character.clone(), url.clone()));
+                                }
+                            }
+                        }
                         let ch = s.channels.entry(channel.clone()).or_default();
                         ch.char_map.insert(nick.clone(), (character.clone(), url.clone()));
                         let url_txt = url.as_deref().unwrap_or("");

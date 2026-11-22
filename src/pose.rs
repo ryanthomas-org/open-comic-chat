@@ -26,6 +26,12 @@
 //   Whisper -> PRIVMSG <nick> :text           (private, not to channel)
 //   Action  -> PRIVMSG #chan :\x01ACTION text\x01  (CTCP ACTION, /me)
 // See irc.rs for the send side, comic.rs for the display side.
+//
+// MS Chat wheel (live samples, Nov 2026): G = 100*k + 10 (k = pose 0..9), E = face*10 + intensity.
+//   Neutral G010E010RM1, Coy G710E010RM1, Happy G310E019RM1, Angry G610E069RM1,
+//   Sad G910E059RM1, Bored G510E039RM1, Scared G810E049RM1, Shout G410E079RM1, Laugh G210E089RM1.
+//   Intensity: map by (G, E/10), keep E%10 raw (sampled default 9 non-Neutral, 0 Neutral; may be inverted).
+//   R optional, T + nick = CAST. Send: to_wire_string -> mschat_wire_for for any non-none style. OldAngle never sent.
 
 use crate::comic::{Emotion, Gesture};
 
@@ -104,6 +110,26 @@ pub fn canonical_wire_for(emotion: Emotion, gesture: Gesture) -> String {
     };
     p.to_wire()
 }
+
+/// MS Chat wire code for one emotion, from the live samples.
+/// Neutral (#G010E010RM1), Coy (#G710E010RM1), Happy (#G310E019RM1),
+/// Angry (#G610E069RM1), Sad (#G910E059RM1), Bored (#G510E039RM1),
+/// Scared (#G810E049RM1), Shout (#G410E079RM1), Laugh (#G210E089RM1).
+/// Send this, not OldAngle or canonical — MS Chat ignores both.
+pub fn mschat_wire_for(emotion: Emotion) -> String {
+    let code = match emotion {
+        Emotion::Neutral => "G010E010RM1",
+        Emotion::Coy => "G710E010RM1",
+        Emotion::Happy => "G310E019RM1",
+        Emotion::Angry => "G610E069RM1",
+        Emotion::Sad => "G910E059RM1",
+        Emotion::Bored => "G510E039RM1",
+        Emotion::Scared => "G810E049RM1",
+        Emotion::Shout => "G410E079RM1",
+        Emotion::Laugh => "G210E089RM1",
+    };
+    format!("(#{code})")
+}
 /// Parse a LEADING canonical code via comic-text, converting back to the
 /// local PoseCode shape. Returns None when no leading canonical code is
 /// present (old-angle codes are handled by the fallback in parse_pose_code).
@@ -137,6 +163,9 @@ fn gesture_from_torso_index(d: u8) -> Option<Gesture> {
     }
 }
 fn parse_canonical_leading(text: &str) -> Option<(String, PoseCode)> {
+    // Canonical is colon form (#G1:1E1:1M1). MS Chat (#G310E019RM1) and OldAngle have no colon — let parse_pose_inner handle them.
+    { let code_part = text.split(')').next().unwrap_or(""); if !code_part.contains(':') { return None; } }
+
     // Parse E/G digits directly as face/torso indices (0..8). Do NOT go
     // through comic_text::Emotion — its table is the old wrong set
     // (Surprised/Afraid/Disgusted/Contemptuous, 0..7) and collapses
@@ -232,10 +261,18 @@ impl PoseCode {
     /// 2.5 does not parse (it falls back to Neutral); it now means
     /// "send pose codes" in the form 2.5 understands.
     pub fn to_wire_string(&self, pose_style: &str) -> String {
-        match pose_style.trim().to_ascii_lowercase().as_str() {
-            "old-angle" | "legacy" | "1.0" | "1.0-2.1" | "2.1" => self.to_old_angle_string(),
+        match pose_style {
             "none" => String::new(),
-            _ => self.to_canonical_string(),
+            "canonical" => {
+                if self.emotion == Emotion::Neutral && self.gesture == Gesture::Neutral {
+                    String::new()
+                } else {
+                    canonical_wire_for(self.emotion, self.gesture)
+                }
+            },
+            "legacy" | "old-angle" => self.to_old_angle_string(),
+            // "old" (default) and "" -> MS Chat 2.5 live format. OldAngle never sent.
+            _ => mschat_wire_for(self.emotion),
         }
     }
     pub fn emotion(&self) -> Emotion { self.emotion }
@@ -283,7 +320,7 @@ fn parse_pose_inner(inner: &str) -> Option<PoseCode> {
         Some(idx) => (&inner[..idx], Some(&inner[idx + 6..])),
         None => (inner, None),
     };
-    let cast: Vec<String> = cast_part.map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default();
+    let mut cast: Vec<String> = cast_part.map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default();
     if code_part.contains(':') { return None; }
     let after_g = code_part.strip_prefix("#G")?;
     if after_g.len() < 7 { return None; }
@@ -292,9 +329,56 @@ fn parse_pose_inner(inner: &str) -> Option<PoseCode> {
     let rest = rest.strip_prefix('E')?;
     if rest.len() < 4 { return None; }
     let e_angle: u16 = rest[..3].parse().ok()?;
-    let rest = &rest[3..];
+    let mut rest = &rest[3..];
+    let has_r = rest.starts_with('R');
+    if has_r { rest = &rest[1..]; }
     let rest = rest.strip_prefix('M')?;
+    if rest.is_empty() { return None; }
     let _mouth: u8 = rest.chars().next()?.to_digit(10)? as u8;
+    let trailing = &rest[1..];
+    if trailing.starts_with('T') && !trailing[1..].is_empty() {
+        let cast_str = &trailing[1..];
+        for part in cast_str.split(|c| c == ',' || c == 'T') {
+            let s = part.trim().to_string();
+            if !s.is_empty() { cast.push(s); }
+        }
+    }
+    // MS Chat: G = 100*k + 10, E = face*10 + intensity (any 0..9). Accept all intensities.
+    let is_mschat = g_angle % 100 == 10 && e_angle >= 10 && e_angle <= 89 && (e_angle / 10) >= 1 && (e_angle / 10) <= 8;
+    if is_mschat {
+        let k = g_angle / 100;
+        let gesture = match k {
+            0 => crate::comic::Gesture::Neutral,
+            1 => crate::comic::Gesture::Wave,
+            2 => crate::comic::Gesture::PointSelf,
+            3 => crate::comic::Gesture::PointOther,
+            4 => crate::comic::Gesture::DoublePoint,
+            5 => crate::comic::Gesture::Shrug,
+            6 => crate::comic::Gesture::Walk3Q,
+            7 => crate::comic::Gesture::SideWalk,
+            8 => crate::comic::Gesture::Walk3QF,
+            _ => crate::comic::Gesture::Neutral,
+        };
+        // Intensity variant: E = (face*10 + intensity). Map by (G, E/10), keep E%10 raw.
+        // e.g. Happy E019 (intensity 9) and Happy E011 (intensity 1) are both Happy.
+        // Do NOT assume 9 = strong — AVB matching may invert. Stored as 0..9 / 9.0, flip here if needed.
+        let e_tens = e_angle / 10;
+        let face_intensity = (e_angle % 10) as f32 / 9.0;
+        let emotion = match (g_angle, e_tens, has_r) {
+            (710, 1, true) => crate::comic::Emotion::Coy,
+            (310, 1, _) => crate::comic::Emotion::Happy,
+            (610, 6, _) => crate::comic::Emotion::Angry,
+            (910, 5, _) => crate::comic::Emotion::Sad,
+            (510, 3, _) => crate::comic::Emotion::Bored,
+            (810, 4, _) => crate::comic::Emotion::Scared,
+            (410, 7, _) => crate::comic::Emotion::Shout,
+            (210, 8, _) => crate::comic::Emotion::Laugh,
+            _ => crate::comic::Emotion::Neutral,
+        };
+        let mut p = PoseCode::from_emotion_gesture(emotion, gesture, face_intensity);
+        p.cast = cast;
+        return Some(p);
+    }
     let gesture = angle_to_gesture(g_angle);
     let emotion = angle_to_emotion(e_angle);
     let mut p = PoseCode::from_emotion_gesture(emotion, gesture, 1.0);
@@ -687,16 +771,18 @@ mod cleanup_0317_pose_state {
         let pose = PoseCode::from_emotion_gesture(Emotion::Happy, Gesture::Wave, 1.0);
         // "old" (previous default) now means canonical v2.5, not OldAngle —
         // MS Chat 2.5 does not parse OldAngle, it falls back to Neutral.
-        assert_eq!(pose.to_wire_string("old"), "(#G1:1E1:1M1)");
-        assert_eq!(pose.to_wire_string(""), "(#G1:1E1:1M1)");
+        // "old" (default) now means MS Chat live format, not canonical — live samples prove it.
+        assert_eq!(pose.to_wire_string("old"), "(#G310E019RM1)");
+        assert_eq!(pose.to_wire_string(""), "(#G310E019RM1)");
         assert_eq!(pose.to_wire_string("canonical"), "(#G1:1E1:1M1)");
         assert_eq!(pose.to_wire_string("legacy"), "(#G045E350M1)");
         assert_eq!(pose.to_wire_string("old-angle"), "(#G045E350M1)");
         assert_eq!(pose.to_wire_string("none"), "");
         // Neutral/Neutral -> no code in canonical (v2.5 PoseStyle::None).
         let neutral = PoseCode::from_emotion_gesture(Emotion::Neutral, Gesture::Neutral, 1.0);
-        assert_eq!(neutral.to_wire_string("old"), "");
-        assert_eq!(neutral.to_wire_string(""), "");
+        // MS Chat sends Neutral explicitly, unlike canonical which omits it.
+        assert_eq!(neutral.to_wire_string("old"), "(#G010E010RM1)");
+        assert_eq!(neutral.to_wire_string(""), "(#G010E010RM1)");
         assert_eq!(neutral.to_wire_string("canonical"), "");
         assert_eq!(neutral.to_wire_string("none"), "");
     }
@@ -740,5 +826,49 @@ mod step1_canonical_bridge_tests {
     }
     #[test] fn trailing_colon_still_rejected() {
         assert!(parse_pose_code("hi (#G2:8E0:8M1)").is_none());
+    }
+}
+
+#[cfg(test)]
+mod mschat_pose_tests {
+    use super::{mschat_wire_for, parse_pose_code};
+    use crate::comic::Emotion;
+    #[test]
+    fn parses_r_and_t() {
+        let (clean, p) = parse_pose_code("(#G610E069RM1) ok i am in mschat").unwrap();
+        assert_eq!(clean, "ok i am in mschat");
+        assert_eq!(p.emotion, Emotion::Angry);
+        let (clean2, p2) = parse_pose_code("(#G710E010RM1) now coy").unwrap();
+        assert_eq!(clean2, "now coy");
+        assert_eq!(p2.emotion, Emotion::Coy);
+        let (clean3, p3) = parse_pose_code("(#G110E010M1Toarion07) coy displayed").unwrap();
+        assert_eq!(clean3, "coy displayed");
+        assert_eq!(p3.cast, vec!["oarion07".to_string()]);
+        let (clean4, p4) = parse_pose_code("(#G310E019RM1) happy").unwrap();
+        assert_eq!(clean4, "happy");
+        assert_eq!(p4.emotion, Emotion::Happy);
+    }
+    #[test]
+    fn wire_matches_samples() {
+        assert_eq!(mschat_wire_for(Emotion::Angry), "(#G610E069RM1)");
+        assert_eq!(mschat_wire_for(Emotion::Coy), "(#G710E010RM1)");
+        assert_eq!(mschat_wire_for(Emotion::Happy), "(#G310E019RM1)");
+        assert_eq!(mschat_wire_for(Emotion::Sad), "(#G910E059RM1)");
+    }
+}
+
+#[cfg(test)]
+mod mschat_intensity_tests {
+    use super::parse_pose_code;
+    use crate::comic::Emotion;
+    #[test]
+    fn intensity_variant_same_emotion() {
+        let (_, p1) = parse_pose_code("(#G310E019RM1) happy high").unwrap();
+        let (_, p2) = parse_pose_code("(#G310E011RM1) happy low").unwrap();
+        assert_eq!(p1.emotion, Emotion::Happy);
+        assert_eq!(p2.emotion, Emotion::Happy);
+        assert!(p1.intensity > p2.intensity);
+        let (_, p3) = parse_pose_code("(#G610E061RM1) angry low").unwrap();
+        assert_eq!(p3.emotion, Emotion::Angry);
     }
 }
