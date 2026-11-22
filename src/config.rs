@@ -122,7 +122,7 @@ return {
     -- character_url = "http://example.com/characters/Frank.AVB",
     background = "Cafe",
     -- background_url = "http://example.com/backgrounds/Cafe.BGB",
-    pose_style = "none", -- "none" = v2.5 sends no pose code (default), "old" = (#G090E090M1) legacy 1.0-2.1 only
+    pose_style = "old", -- "old" = OldAngle (#GxxxExxxM1) computed from wheel+text (default), "none" = v2.5 sends no pose code
     auto_download = true,
     show_pose_codes_in_text = true,
     -- titles: custom room-entry title cards (the "Starring pane" — the
@@ -278,7 +278,7 @@ pub struct ComicConfig {
     #[serde(default)]
     pub background_url: Option<String>,
     #[serde(default = "default_pose_style")]
-    pub pose_style: String, // "none" = v2.5 (send NO pose code, default), "old" = legacy (#G090E090M1) for 1.0-2.1 only. "new" (invented colon form) is migrated to "none" on load.
+    pub pose_style: String, // "old" = OldAngle (#GxxxExxxM1) computed from wheel+text (default), "none" = v2.5 plain text, no code. "new" (invented colon form) is migrated to "none" on load.
     #[serde(default = "default_true")]
     pub auto_download: bool, // Comics View: auto-download AVB/BGB you do not have
     #[serde(default = "default_true")]
@@ -307,7 +307,7 @@ pub struct ComicConfig {
     #[serde(default)]
     pub ctcp_version: Option<String>,
 }
-fn default_pose_style() -> String { "none".to_string() }
+fn default_pose_style() -> String { "old".to_string() }
 fn default_sound_path() -> String { "~/.config/comic-chat/Sounds".to_string() }
 
 /// Optional debug log. Disabled when `debug_log` is absent from config.lua.
@@ -345,7 +345,7 @@ impl Default for AppConfig {
                 name: "Libera".into(), host: "irc.libera.chat".into(), port: Some(6697), tls: true,
                 nick: None, channels: vec!["#libera".into()], sasl: None, autoconnect: true,
             }],
-            comic: ComicConfig { messages_per_panel: 3, avatar_seed: 7, character: "Frank".into(), background: "Cafe".into(), character_url: None, background_url: None, pose_style: "none".into(), auto_download: true, show_pose_codes_in_text: true, strip_pose_codes_in_comic: true, titles: Vec::new(), sound_path: default_sound_path(), ctcp_version: None },
+            comic: ComicConfig { messages_per_panel: 3, avatar_seed: 7, character: "Frank".into(), background: "Cafe".into(), character_url: None, background_url: None, pose_style: "old".into(), auto_download: true, show_pose_codes_in_text: true, strip_pose_codes_in_comic: true, titles: Vec::new(), sound_path: default_sound_path(), ctcp_version: None },
             debug_log: DebugLogConfig::default(),
             icons: HashMap::new(),
             path: default_config_path(),
@@ -524,7 +524,7 @@ pub fn load(path: &PathBuf) -> Result<AppConfig, Box<dyn std::error::Error>> {
             character_url: comic_t.get::<String>("character_url").ok(),
             background_url: comic_t.get::<String>("background_url").ok(),
             pose_style: {
-                let raw = lua_str(&comic_t, "pose_style", "none");
+                let raw = lua_str(&comic_t, "pose_style", "old");
                 // Migrate the invented "new" colon form to "none" (v2.5
                 // sends no pose code). "old" is kept as legacy opt-in.
                 match raw.trim().to_ascii_lowercase().as_str() {

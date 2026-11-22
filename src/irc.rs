@@ -1,13 +1,13 @@
 // IRC + Comic Chat wire protocol.
 // See pose.rs for the full spec. Summary (v2.5 behaviour, 0.3.17):
 // - CTCP VERSION: direct PRIVMSG \x01VERSION\x01 -> NOTICE \x01VERSION Open Comic Chat (Version 0.3.17)\x01 (see crate::version_reply).
-// - Say:    PRIVMSG #ch :text            (v2.5 sends NO pose code)
+// - Say:    PRIVMSG #ch :(#GxxxExxxM1) text  (pose_style="old", default) — plain text when pose_style="none"
 // - Think:  PRIVMSG #ch :*thinks* text
 // - Whisper: PRIVMSG <nick> :text
 // - Action: PRIVMSG #ch :\x01ACTION text\x01
 // - Character: PRIVMSG #ch :# Appears as Name.http://.../Name.AVB  (sent on JOIN + whenever a new user joins, so they learn our character)
 // - Background: PRIVMSG #ch :# Background as Name.http://.../Name.BGB (share, optional)
-// Legacy opt-in only (pose_style = "old"): Say appends (#G090E090M1).
+// pose_style="old" (default): Say prepends OldAngle (#GxxxExxxM1) computed from wheel+text. pose_style="none": plain text, no code.
 // The invented (#G2:8E0:8M1) colon form is never sent. CAST:... is never sent.
 // Incoming Appears/Background lines are NOT balloons — they update the per-nick
 // character/background map and are shown as a system line in the text log.
@@ -153,10 +153,11 @@ pub async fn run_server(cfg: ServerConfig, me_nick: String, mut cmd_rx: mpsc::Un
     let mut self_away: Option<String> = None;
     // 0.3.17: Connected is sent only on 001, not on TCP/TLS connect.
 
-    // Helper: append pose code to outgoing text (if any). Returns wire text.
+    // Helper: prepend pose code to outgoing text (if any). Returns wire text.
+    // Leading form: "(#GxxxExxxM1) text" — matches parse_pose_code leading handling + OEC leading form.
     let with_pose = |text: &str, pose: &str| -> String {
         let p = pose.trim();
-        if p.is_empty() { text.to_string() } else { format!("{text} {p}") }
+        if p.is_empty() { text.to_string() } else { format!("{p} {text}") }
     };
 
     loop {

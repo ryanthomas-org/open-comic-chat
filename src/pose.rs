@@ -3,8 +3,10 @@
 // CORRECTED in 0.3.17 (was wrong in 0.3):
 //   Legacy (1.0-2.1, parse-only, visible to non-Comic Chat users as "garbage"):
 //     (#G010E010M1)  — G = gesture angle 000-359, E = expression angle 000-359, M = mouth 0-9
-//   v2.5: sends NO pose code on the wire. Gesture / expression are
+//   v2.5 with pose_style="none": sends NO pose code. Gesture / expression are
 //     inferred locally from text + emotion wheel. Plain text.
+//   Default pose_style="old": sends OldAngle "(#GxxxExxxM1)" LEADING, computed
+//     from wheel+text via to_old_angle_string(). See Step 112 in app.rs.
 //   The (#G2:8E0:8M1) colon form was INVENTED in this client (0.3) and
 //     is supported by NO other client. It is never generated anymore.
 //     It is still PARSED for compat with 0.3 builds, but never re-emitted.
@@ -140,8 +142,21 @@ impl PoseCode {
         Self { face_index, torso_index, requested: false, emotion, gesture, intensity: strength.clamp(0.0, 1.0), cast: Vec::new() }
     }
     pub fn with_cast(mut self, cast: Vec<String>) -> Self { self.cast = cast; self }
-    /// v2.5 sends nothing on the wire. Always empty.
+    /// v2.5 "none" form — always empty. Kept for compat / tests.
+    /// Actual send uses to_wire_string(style).
     pub fn to_code_string(&self) -> String { String::new() }
+    /// OldAngle legacy code: "(#GxxxExxxM1)" computed from emotion/gesture.
+    /// Never includes CAST. Angles invert angle_to_emotion / angle_to_gesture.
+    pub fn to_old_angle_string(&self) -> String {
+        format!("(#G{:03}E{:03}M1)", gesture_to_angle(self.gesture), emotion_to_angle(self.emotion))
+    }
+    /// Wire string for a pose_style: "old"/"legacy" -> OldAngle, anything else ("none") -> "".
+    pub fn to_wire_string(&self, pose_style: &str) -> String {
+        match pose_style.trim().to_ascii_lowercase().as_str() {
+            "old" | "legacy" => self.to_old_angle_string(),
+            _ => String::new(),
+        }
+    }
     pub fn emotion(&self) -> Emotion { self.emotion }
     pub fn gesture(&self) -> Gesture { self.gesture }
     pub fn strength(&self) -> f32 { self.intensity }
@@ -154,6 +169,16 @@ pub fn emotion_angle_index(e: Emotion) -> i16 {
 /// Gesture -> torso-record index: 0 = Neutral, 1..8 = specials in avatar.h order.
 pub fn gesture_index(g: Gesture) -> i16 {
     match g { Gesture::Neutral => 0, Gesture::Wave => 1, Gesture::PointSelf => 2, Gesture::PointOther => 3, Gesture::DoublePoint => 4, Gesture::Shrug => 5, Gesture::Walk3Q => 6, Gesture::SideWalk => 7, Gesture::Walk3QF => 8 }
+}
+/// Emotion -> OldAngle degrees. Inverse of angle_to_emotion.
+/// Neutral 0, Coy 45, Bored 90, Scared 135, Sad 180, Angry 225, Shout 270, Laugh 315, Happy 350 (step 8 -> Happy).
+pub fn emotion_to_angle(e: Emotion) -> u16 {
+    match e { Emotion::Neutral => 0, Emotion::Happy => 350, Emotion::Coy => 45, Emotion::Bored => 90, Emotion::Scared => 135, Emotion::Sad => 180, Emotion::Angry => 225, Emotion::Shout => 270, Emotion::Laugh => 315 }
+}
+/// Gesture -> OldAngle degrees. Inverse of angle_to_gesture.
+/// Neutral 0, Wave 45, PointSelf 90, PointOther 135, DoublePoint 180, Shrug 225, Walk3Q 270, SideWalk 315, Walk3QF 350 (step 8).
+pub fn gesture_to_angle(g: Gesture) -> u16 {
+    match g { Gesture::Neutral => 0, Gesture::Wave => 45, Gesture::PointSelf => 90, Gesture::PointOther => 135, Gesture::DoublePoint => 180, Gesture::Shrug => 225, Gesture::Walk3Q => 270, Gesture::SideWalk => 315, Gesture::Walk3QF => 350 }
 }
 /// Nearest MS Chat emotion for a legacy angle. Legacy-only, never generated.
 pub fn angle_to_emotion(angle: u16) -> Emotion {
@@ -562,6 +587,27 @@ mod cleanup_0317_pose_state {
             .with_cast(vec!["Alice".to_string()]);
         assert_eq!(pose.cast, vec!["Alice"]);
         assert_eq!(pose.to_code_string(), "");
+    }
+    #[test]
+    fn old_angle_roundtrip() {
+        let pose = PoseCode::from_emotion_gesture(Emotion::Happy, Gesture::Wave, 1.0);
+        assert_eq!(pose.to_old_angle_string(), "(#G045E350M1)");
+        let (clean, p) = parse_pose_code("(#G045E350M1) hello").unwrap();
+        assert_eq!(clean, "hello");
+        assert_eq!(p.emotion(), Emotion::Happy);
+        assert_eq!(p.gesture(), Gesture::Wave);
+        let neutral = PoseCode::from_emotion_gesture(Emotion::Neutral, Gesture::Neutral, 1.0);
+        assert_eq!(neutral.to_old_angle_string(), "(#G000E000M1)");
+        let bored_self = PoseCode::from_emotion_gesture(Emotion::Bored, Gesture::PointSelf, 1.0);
+        assert_eq!(bored_self.to_old_angle_string(), "(#G090E090M1)");
+    }
+    #[test]
+    fn wire_string_dispatch() {
+        let pose = PoseCode::from_emotion_gesture(Emotion::Happy, Gesture::Wave, 1.0);
+        assert_eq!(pose.to_wire_string("old"), "(#G045E350M1)");
+        assert_eq!(pose.to_wire_string("legacy"), "(#G045E350M1)");
+        assert_eq!(pose.to_wire_string("none"), "");
+        assert_eq!(pose.to_wire_string(""), "");
     }
 }
 

@@ -426,7 +426,7 @@ impl ComicChatApp {
         // wheel emotion + text gesture, so preview label, preview image
         // and sent pose all agree. Frozen is handled inside analyze().
         let (emotion, _balloon, gesture, strength) = comic::analyze(&self.input, Some((self.wheel_emotion, self.wheel_strength)), self.wheel_frozen);
-        // v2.5 default is None (send nothing). "old" = legacy angle code.
+        // pose_style="old" (default) = OldAngle legacy code. "none" = send nothing (v2.5 plain text).
         // The invented NewIndexed is never produced — see pose.rs.
         // Step 112: always OldAngle. None sent empty so peers
         // re-guessed from text and never matched our wheel. OldAngle is
@@ -831,7 +831,7 @@ ch.title_pending = false;
             self.pending_chr_cast = self.panel_cast.clone();
             self.panel_cast.clear();
             let pose = self.current_pose_code();
-            let pose_str = pose.to_code_string();
+            let pose_str = pose.to_wire_string(&self.cfg.comic.pose_style);
             let channel = self.active_channel.clone();
             let server = self.active_server.clone();
             let sent = {
@@ -957,7 +957,7 @@ ch.title_pending = false;
         let channel = self.active_channel.clone();
         let server = self.active_server.clone();
         let pose = self.current_pose_code();
-        let pose_str = pose.to_code_string();
+        let pose_str = pose.to_wire_string(&self.cfg.comic.pose_style);
         // Cast is LOCAL-ONLY (never on the wire). It is stored on the
         // local message via the pose's `cast` field; the wire pose code
         // contains no CAST token (see pose.rs).
@@ -985,7 +985,7 @@ ch.title_pending = false;
         if !sent {
             crate::log::warn("app", format!("send_current: no IRC handle for {} (not connected) — showing locally as offline demo so panel still renders. Fix: Connect All / check server status, see irc logs for connect failure.", self.active_server));
             // Offline demo: show locally with the same pose code so the panel looks identical
-            let wire = format!("{text} {pose_str}");
+            let wire = if pose_str.is_empty() { text.clone() } else { format!("{pose_str} {text}") };
             let (char_name, char_url) = (self.cfg.comic.character.clone(), self.cfg.comic.character_url.clone());
             let me = self.my_nick();
             let msg = comic::make_message_full(&me, &wire, true, kind, Some((self.wheel_emotion, self.wheel_strength)), self.wheel_frozen, &char_name, char_url, self.panel_cast.clone());
@@ -1092,7 +1092,7 @@ ch.title_pending = false;
         let channel = self.active_channel.clone();
         let server = self.active_server.clone();
         let pose = self.current_pose_code();
-        let cmd = IrcCommand::SendMessage { channel: channel.clone(), text, pose_code: pose.to_code_string() };
+        let cmd = IrcCommand::SendMessage { channel: channel.clone(), text, pose_code: pose.to_wire_string(&self.cfg.comic.pose_style) };
         if let Ok(map) = self.handles.lock() {
             if let Some(tx) = map.get(&server) { let _ = tx.send(cmd); }
         }
