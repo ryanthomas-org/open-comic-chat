@@ -1,0 +1,3 @@
+pub fn irc_is_privmsg(s: &str) -> bool {
+        // FIX Wire-Log-File v2
+        crate::log::info("WIRE_POSE", "irc::irc_is_privmsg PRIVMSG".to_string()); s.contains(" PRIVMSG ") }

@@ -1,0 +1,3 @@
+pub fn format_privmsg(target: &str, text: &str) -> String {
+    format!("PRIVMSG {} :{}", target, text)
+}

@@ -1,0 +1,215 @@
+    fn send_current(&mut self) {
+        // FIX Wire-Coy: log at send time. See debug.log for WIRE_POSE.
+        crate::log::info("WIRE_POSE", format!("send fn=send_current"));
+
+        let __variant = self.neutral_cycle as u64;
+        // NEUTRAL_CYCLE_SEND_0317: capture before any pose is used. Cycle moves once,
+        // after send, so preview == wire == local.
+        let __cycle_should_advance = { let __p = self.current_pose_code(); __p.emotion() == Emotion::Neutral && !self.wheel_frozen };
+        // IRC is line-based: a pasted \r / \n must never split one PRIVMSG
+        // into two wire lines (injection). Replace with space.
+        let text = crate::irc::sanitize_outgoing_line(self.input.trim());
+        // Empty Enter = <Chr>: pose-only, NOT a bubble. Microsoft Chat:
+        // it updates our pose in the last panel, or adds us to it if
+        // others are there and we are not. Members selected in the
+        // Members list (panel_cast) are included via pending_chr_cast,
+        // consumed by the local echo in drain_events.
+        if text.is_empty() {
+            crate::log::info("app", format!("send_current: empty input — sending <Chr> pose-only, cast={:?}", self.panel_cast));
+            // CHR_CAST_0317: build the pose BEFORE clearing panel_cast.
+            // Clearing first made pose.cast empty, so the wire <Chr> had
+            // no Tnick and peers never added the included user. Local echo
+            // worked via pending_chr_cast, which masked the wire bug.
+            let pose = self.current_pose_code();
+            self.pending_chr_cast = self.panel_cast.clone();
+            self.panel_cast.clear();
+            let pose_str = pose.to_wire_string(&self.cfg.comic.pose_style);
+            let channel = self.active_channel.clone();
+            let server = self.active_server.clone();
+            let sent = {
+                if let Ok(map) = self.handles.lock() {
+                    if let Some(tx) = map.get(&server) {
+                        tx.send(IrcCommand::SendMessage { channel: channel.clone(), text: "<Chr>".to_string(), pose_code: pose_str }).is_ok()
+                    } else { false }
+                } else { false }
+            };
+            if !sent {
+                // Offline: no echo will come, so apply the pose update locally.
+                let me = self.my_nick();
+                let (char_name, char_url) = (self.cfg.comic.character.clone(), self.cfg.comic.character_url.clone());
+                let probe = comic::make_message_full(&me, "<Chr>", true, MessageKind::Say, Some((self.wheel_emotion, self.wheel_strength)), self.wheel_frozen, &char_name, char_url, Vec::new());
+                let cast = std::mem::take(&mut self.pending_chr_cast);
+                self.apply_chr_pose(&server, &channel, &me, &probe, cast);
+            }
+            if !self.wheel_frozen {
+                self.wheel_emotion = Emotion::Neutral;
+                self.wheel_strength = 0.4;
+            }
+            self.input.clear();
+        if __cycle_should_advance { self.neutral_cycle = self.neutral_cycle.wrapping_add(1); } // NEUTRAL_CYCLE_SEND_0317: advance once on send
+
+            self.focus_compose = true;
+            return;
+        }
+        crate::log::info("app", format!("send_current: kind={:?} server={} channel={} whisper_target={:?} cast={:?} preview={:?}",
+            self.input_kind.label(), self.active_server, self.active_channel, self.whisper_target, self.panel_cast, crate::log::preview_redacted(&text)));
+        // Slash commands handled locally, never sent as chat:
+        // /away [message] — away with that message. Bare /away toggles:
+        //   away -> back (FAQ: "type: /away" to return), not away ->
+        //   away with the default "Gone fishing."
+        // /back — back.
+        if text.eq_ignore_ascii_case("/back") || text.get(..6).map_or(false, |p| p.eq_ignore_ascii_case("/back ")) {
+            self.set_away(None);
+            self.input.clear();
+        if __cycle_should_advance { self.neutral_cycle = self.neutral_cycle.wrapping_add(1); } // NEUTRAL_CYCLE_SEND_0317: advance once on send
+
+            self.focus_compose = true;
+            return;
+        }
+        if text.eq_ignore_ascii_case("/away") || text.get(..6).map_or(false, |p| p.eq_ignore_ascii_case("/away ")) {
+            let arg = text.get(..5).filter(|p| p.eq_ignore_ascii_case("/away")).map(|_| &text[5..]).unwrap().trim();
+            if arg.is_empty() {
+                if self.away_message.is_some() { self.set_away(None); }
+                else { self.set_away(Some("Gone fishing.".to_string())); }
+            } else {
+                self.set_away(Some(arg.to_string()));
+            }
+            self.input.clear();
+        if __cycle_should_advance { self.neutral_cycle = self.neutral_cycle.wrapping_add(1); } // NEUTRAL_CYCLE_SEND_0317: advance once on send
+
+            self.focus_compose = true;
+            return;
+        }
+        // /version [nick] — ask a nick for their client version (CTCP VERSION).
+        // Bare /version uses the whisper target, else the selected member.
+        if text.eq_ignore_ascii_case("/version") || text.get(..9).map_or(false, |p| p.eq_ignore_ascii_case("/version ")) {
+            let arg = text.get(8..).unwrap_or("").trim();
+            let target = if !arg.is_empty() { arg.split_whitespace().next().unwrap_or("").to_string() } else if let Some(t) = self.whisper_target.clone() { t } else if let Some(t) = self.panel_cast.first().cloned() { t } else { String::new() };
+            if target.is_empty() {
+                self.copy_status = "Usage: /version <nick> — or select a member first.".to_string();
+            } else {
+                let server = self.active_server.clone();
+                self.send_version_query(&server, &target);
+            }
+            self.input.clear();
+        if __cycle_should_advance { self.neutral_cycle = self.neutral_cycle.wrapping_add(1); } // NEUTRAL_CYCLE_SEND_0317: advance once on send
+
+            self.focus_compose = true;
+            return;
+        }
+        // Step 1 (0.3.17, review 3.9): Unknown slash commands are NEVER sent as chat.
+        // Before this fix, any "/xxx" not handled above fell through to SendMessage
+        // and was posted to the channel as public chat — including
+        // "/msg NickServ IDENTIFY <password>".
+        // Known slash inputs that may pass through: "/me <text>" and "/join <channel>"
+        // when the input kind is Say (handled downstream in irc.rs SendMessage).
+        // "/away" and "/back" already returned above. Everything else starting
+        // with '/' is blocked here. Only the command name is logged/shown,
+        // never the args, so a mistyped password is not written to the log or
+        // the text log. "//" escape (send a literal leading '/') is NOT yet
+        // implemented; "//..." is blocked as unknown for now.
+        if text.starts_with('/') {
+            let cmd_name = text.split_whitespace().next().unwrap_or("/").to_string();
+            let has_arg = text.splitn(2, ' ').nth(1).map(|a| !a.trim().is_empty()).unwrap_or(false);
+            let is_known = (cmd_name.eq_ignore_ascii_case("/me") || cmd_name.eq_ignore_ascii_case("/join")) && has_arg && self.input_kind == MessageKind::Say;
+            if !is_known {
+                crate::log::warn("app", format!("send_current: blocked unknown slash command {cmd_name:?} — not sent as chat"));
+                let line = format!("Unknown command: {cmd_name} — not sent.");
+                self.copy_status = line.clone();
+                if let Some(s) = self.servers.get_mut(&self.active_server) {
+                    if let Some(ch) = s.channels.get_mut(&self.active_channel) {
+                        ch.text_log.push(("System".into(), line));
+                    }
+                }
+                self.input.clear();
+        if __cycle_should_advance { self.neutral_cycle = self.neutral_cycle.wrapping_add(1); } // NEUTRAL_CYCLE_SEND_0317: advance once on send
+
+                self.focus_compose = true;
+                return;
+            }
+        }
+        let kind = self.input_kind;
+        // A (sound) message we send plays locally. Whisper is the
+        // exception: its server echo comes back through route_private,
+        // which plays it — playing here too would play it twice.
+        // /part [channel] — bare /part leaves the current channel.
+        // Was ignored (Step 34 stub). Explicit arg wins, bare uses active_channel.
+        if text == "/part" || text.starts_with("/part ") {
+            let arg = text.strip_prefix("/part").unwrap().trim();
+            let target = if arg.is_empty() {
+                self.active_channel.clone()
+            } else {
+                let first = arg.split_whitespace().next().unwrap_or("");
+                if first.starts_with('#') || first.starts_with('&') || first.starts_with('+') || first.starts_with('!') {
+                    first.to_string()
+                } else if first.is_empty() {
+                    self.active_channel.clone()
+                } else {
+                    format!("#{first}")
+                }
+            };
+            if !target.is_empty() {
+                let server = self.active_server.clone();
+                if let Ok(map) = self.handles.lock() {
+                    if let Some(tx) = map.get(&server) { let _ = tx.send(IrcCommand::Part { channel: target.clone() }); }
+                }
+                crate::log::info("app", format!("send_current: /part -> PART {target} on {server}"));
+            }
+            self.input.clear();
+        if __cycle_should_advance { self.neutral_cycle = self.neutral_cycle.wrapping_add(1); } // NEUTRAL_CYCLE_SEND_0317: advance once on send
+
+            self.focus_compose = true;
+            return;
+        }
+        if kind != MessageKind::Whisper { self.maybe_play_sound(&text); }
+        let channel = self.active_channel.clone();
+        let server = self.active_server.clone();
+        let pose = self.current_pose_code();
+        let pose_str = pose.to_wire_string(&self.cfg.comic.pose_style);
+        // Cast is on the wire as Tnick in the pose code (see pose.rs
+        // to_wire_string) and stored on the local message via the
+        // pose's `cast` field.
+        let cmd = match kind {
+            MessageKind::Say => IrcCommand::SendMessage { channel: channel.clone(), text: text.clone(), pose_code: pose_str.clone() },
+            MessageKind::Think => IrcCommand::Think { channel: channel.clone(), text: text.clone(), pose_code: pose_str.clone() },
+            MessageKind::Whisper => {
+                if let Some(t) = self.whisper_target.clone() { IrcCommand::Whisper { target: t, text: text.clone(), pose_code: pose_str.clone() } }
+                else { IrcCommand::SendMessage { channel: channel.clone(), text: text.clone(), pose_code: pose_str.clone() } }
+            }
+            MessageKind::Action => IrcCommand::Action { channel: channel.clone(), text: text.clone(), pose_code: pose_str.clone() },
+            // Unreachable: title cards are local-only, never composed
+            // (input_kind is only set from the four kind buttons). This
+            // arm exists so the match stays total.
+            MessageKind::Title | MessageKind::Info => IrcCommand::SendMessage { channel: channel.clone(), text: text.clone(), pose_code: pose_str.clone() },
+        };
+        let sent = {
+            if let Ok(map) = self.handles.lock() {
+                if let Some(tx) = map.get(&server) { tx.send(cmd).is_ok() } else { false }
+            } else { false }
+        };
+        if sent {
+            crate::log::debug("app", format!("send_current: queued to IRC handle for {} — wire will be PRIVMSG with pose {}", self.active_server, pose_str));
+        }
+        if !sent {
+            crate::log::warn("app", format!("send_current: no IRC handle for {} (not connected) — showing locally as offline demo so panel still renders. Fix: Connect All / check server status, see irc logs for connect failure.", self.active_server));
+            // Offline demo: show locally with the same pose code so the panel looks identical
+            let wire = if pose_str.is_empty() { text.clone() } else { format!("{pose_str} {text}") };
+            let (char_name, char_url) = (self.cfg.comic.character.clone(), self.cfg.comic.character_url.clone());
+            let me = self.my_nick();
+            let msg = comic::make_message_full(&me, &wire, true, kind, Some((self.wheel_emotion, self.wheel_strength)), self.wheel_frozen, &char_name, char_url, self.panel_cast.clone());
+            if let Some(s) = self.servers.get_mut(&server) {
+                let ch = s.channels.entry(channel).or_default();
+                ch.messages.push(msg);
+            }
+        }
+        // Panel cast is for the NEXT panel only — clear after sending (original behaviour)
+        self.panel_cast.clear();
+        if !self.wheel_frozen {
+            self.wheel_emotion = Emotion::Neutral;
+            self.wheel_strength = 0.4;
+        }
+        self.input.clear();
+        if __cycle_should_advance { self.neutral_cycle = self.neutral_cycle.wrapping_add(1); } // NEUTRAL_CYCLE_SEND_0317: advance once on send
+
+        self.focus_compose = true;
+    }

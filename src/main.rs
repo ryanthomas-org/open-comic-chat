@@ -1,4 +1,5 @@
 mod about;
+mod g_pose_index;
 pub mod version;
 mod app;
 mod icons;

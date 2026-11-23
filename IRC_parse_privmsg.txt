@@ -1,0 +1,13 @@
+fn parse_privmsg(line: &str) -> Option<(String, String, String, bool)> {
+    let rest = match line.strip_prefix(':') { Some(r) => r, None => { return None; } };
+    let (prefix, after) = rest.split_once(' ')?;
+    let nick = prefix.split('!').next()?.to_string();
+    let after = after.strip_prefix("PRIVMSG ")?;
+    let (target, text) = after.split_once(" :")?;
+    // CTCP = payload wrapped in \x01 ... \x01. Report it so callers can
+    // tell a real CTCP AWAY / VERSION from plain chat that happens to
+    // say "AWAY ..." or "VERSION".
+    let is_ctcp = text.starts_with('\x01') && text.ends_with('\x01');
+    let text = text.strip_prefix('\x01').and_then(|t| t.strip_suffix('\x01')).map(|t| t.strip_prefix("ACTION ").unwrap_or(t).to_string()).unwrap_or_else(|| text.to_string());
+    Some((target.to_string(), nick, text, is_ctcp))
+}

@@ -8,9 +8,10 @@ use egui::Color32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Emotion { Neutral, Happy, Coy, Bored, Scared, Sad, Angry, Shout, Laugh }
 impl Emotion {
-    /// MS Chat wheel order (avatar.h EM_*): Happy 0, Coy 45, Bored 90,
-    /// Scared 135, Sad 180, Angry 225, Shout 270, Laugh 315 degrees.
-    pub fn all() -> [Emotion; 8] { [Emotion::Happy, Emotion::Coy, Emotion::Bored, Emotion::Scared, Emotion::Sad, Emotion::Angry, Emotion::Shout, Emotion::Laugh] }
+    /// Wheel UI order, Shout on top: draw_emotion_wheel puts
+    /// all()[0] at the top, clockwise. Shout, Laugh, Happy, Coy,
+    /// Bored, Scared, Sad, Angry.
+    pub fn all() -> [Emotion; 8] { [Emotion::Shout, Emotion::Laugh, Emotion::Happy, Emotion::Coy, Emotion::Bored, Emotion::Scared, Emotion::Sad, Emotion::Angry] }
     pub fn angle_deg(&self) -> u16 {
         match self { Emotion::Neutral => 0, Emotion::Happy => 0, Emotion::Coy => 45, Emotion::Bored => 90, Emotion::Scared => 135, Emotion::Sad => 180, Emotion::Angry => 225, Emotion::Shout => 270, Emotion::Laugh => 315 }
     }
@@ -55,6 +56,7 @@ impl MessageKind { pub fn label(&self) -> &'static str { match self { MessageKin
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub struct ComicMessage {
+    pub neutral_variant: u64,
     pub nick: String, pub text: String, pub is_me: bool,
     pub emotion: Emotion, pub balloon: Balloon, pub gesture: Gesture,
     pub kind: MessageKind, pub strength: f32,
@@ -163,7 +165,7 @@ pub fn make_message(nick: &str, text: &str, is_me: bool) -> ComicMessage {
     let _shout_letters: Vec<char> = text.chars().filter(|c| c.is_alphabetic()).collect();
     let _shout_all_caps = !_shout_letters.is_empty() && _shout_letters.len() > 3 && _shout_letters.iter().all(|c| c.is_uppercase());
     if !_has_pose && (_shout_all_caps || text.trim().ends_with("!!!") || text.trim().ends_with("!!")) {
-        m.emotion = Emotion::Shout;
+        // Step 5: caps = Balloon::Shout only. Avatar stays as analyzed / pose-coded. Old code set Emotion::Shout and cycled avatar to random angry pose.
         m.balloon = Balloon::Shout;
     }
     m
@@ -198,7 +200,7 @@ pub fn make_message_full(nick: &str, text: &str, is_me: bool, kind: MessageKind,
         let _shout_letters: Vec<char> = clean_text.chars().filter(|c| c.is_alphabetic()).collect();
         let _shout_all_caps = !_shout_letters.is_empty() && _shout_letters.len() > 3 && _shout_letters.iter().all(|c| c.is_uppercase());
         if _shout_all_caps || clean_text.trim().ends_with("!!!") || clean_text.trim().ends_with("!!") {
-            (Emotion::Shout, Balloon::Shout)
+            (emotion, Balloon::Shout) // Step 5: keep emotion, only balloon Shouts
         } else { (emotion, balloon) }
     } else { (emotion, balloon) };
     let gesture = match kind { MessageKind::Think => Gesture::Neutral, MessageKind::Action => Gesture::Wave, _ => gesture };
@@ -212,6 +214,7 @@ pub fn make_message_full(nick: &str, text: &str, is_me: bool, kind: MessageKind,
         clean_text.strip_prefix("*thinks*").map(|s| s.trim().to_string()).unwrap_or_else(|| clean_text.to_string())
     } else { clean_text.to_string() };
     ComicMessage {
+        neutral_variant: 0,
         nick: nick.to_string(), text: display_text, is_me, emotion, balloon, gesture, kind, strength,
         pose: parsed_pose, character: if character.is_empty() { nick.to_string() } else { character.to_string() },
         character_url, cast: full_cast, raw_with_code,
@@ -783,7 +786,10 @@ mod cleanup_0317_comic_state {
     #[test]
     fn shout_uses_shout_balloon() {
         let m = make_message("Frank", "HELLO!!!", false);
-        assert_eq!(m.emotion, Emotion::Shout);
+        // Step 5: caps / !!! is Balloon::Shout only. Avatar stays Neutral.
+        // Old assertion expected Emotion::Shout, which cycled the avatar
+        // to a random angry pose - the bug Step 5 fixed.
+        assert_eq!(m.emotion, Emotion::Neutral);
         assert_eq!(m.balloon, Balloon::Shout);
     }
     #[test]

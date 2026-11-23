@@ -1,0 +1,2 @@
+pub fn irc_parse_privmsg_target(s: &str) -> String {
+        crate::log::info("WIRE_POSE", format!("sending PRIVMSG fn=irc_parse_privmsg_target")); let parts: Vec<&str> = s.split_whitespace().collect(); for (i, p) in parts.iter().enumerate() { if *p == "PRIVMSG" && i + 1 < parts.len() { return parts[i + 1].to_string(); } } "".to_string() }

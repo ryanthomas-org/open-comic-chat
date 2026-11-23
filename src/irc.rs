@@ -2680,11 +2680,14 @@ pub fn irc_parse_action_text(s: &str) -> String { if let Some(pos) = s.find("ACT
 
 
 
-pub fn irc_is_privmsg(s: &str) -> bool { s.contains(" PRIVMSG ") }
+pub fn irc_is_privmsg(s: &str) -> bool {
+        // FIX Wire-Log-File v2
+        crate::log::info("WIRE_POSE", "irc::irc_is_privmsg PRIVMSG".to_string()); s.contains(" PRIVMSG ") }
 
 
 
-pub fn irc_parse_privmsg_target(s: &str) -> String { let parts: Vec<&str> = s.split_whitespace().collect(); for (i, p) in parts.iter().enumerate() { if *p == "PRIVMSG" && i + 1 < parts.len() { return parts[i + 1].to_string(); } } "".to_string() }
+pub fn irc_parse_privmsg_target(s: &str) -> String {
+        crate::log::info("WIRE_POSE", format!("sending PRIVMSG fn=irc_parse_privmsg_target")); let parts: Vec<&str> = s.split_whitespace().collect(); for (i, p) in parts.iter().enumerate() { if *p == "PRIVMSG" && i + 1 < parts.len() { return parts[i + 1].to_string(); } } "".to_string() }
 
 
 

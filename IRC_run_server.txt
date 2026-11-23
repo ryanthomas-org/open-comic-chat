@@ -1,0 +1,405 @@
+pub async fn run_server(cfg: ServerConfig, me_nick: String, mut cmd_rx: mpsc::UnboundedReceiver<IrcCommand>, event_tx: mpsc::UnboundedSender<IrcEvent>, ctcp_version: Option<String>) {
+    let server_name = cfg.name.clone();
+    crate::log::info("irc", format!("run_server starting: server={} host={} port={} tls={} nick_fallback={} channels={:?} sasl_user={:?} autoconnect={}",
+        server_name, cfg.host, cfg.effective_port(), cfg.tls, me_nick, cfg.channels, cfg.sasl.as_ref().map(|s| s.user.clone()), cfg.autoconnect));
+    let send_ev = |ev: IrcEvent| { let _ = event_tx.send(ev); };
+    let tcp = match connect_tcp(&cfg.host, cfg.effective_port()).await {
+        Ok(t) => t,
+        Err(e) => { crate::log::error("irc", format!("run_server {}: TCP connect failed: {e} — disconnecting, no IRC handshake attempted", server_name)); send_ev(IrcEvent::Disconnected { server: server_name, reason: format!("connect: {e}") }); return; }
+    };
+    let stream: BoxStream = if cfg.tls {
+        crate::log::debug("irc", format!("TLS handshake starting for {} host={} — using webpki roots, SNI={}", server_name, cfg.host, cfg.host));
+        let connector = TlsConnector::from(tls_config());
+        let dns_name = match cfg.host.clone().try_into() { Ok(n) => n, Err(_) => { crate::log::error("irc", format!("TLS: invalid hostname {:?} for {} — hostname must be a valid DNS name for SNI, check config", cfg.host, server_name)); send_ev(IrcEvent::Disconnected { server: server_name, reason: "invalid TLS hostname".into() }); return; } };
+        match connector.connect(dns_name, tcp).await { Ok(tls) => { crate::log::info("irc", format!("TLS handshake succeeded for {}", server_name)); Box::new(tls) }, Err(e) => { crate::log::error("irc", format!("TLS handshake failed for {}: {e} — check server TLS, port (6697 for TLS, 6667 for plain), and system roots", server_name)); send_ev(IrcEvent::Disconnected { server: server_name, reason: format!("TLS: {e}") }); return; } }
+    } else { crate::log::debug("irc", format!("Plain TCP (no TLS) for {} — wire text including SASL if any will be unencrypted", server_name)); Box::new(tcp) };
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut lines = BufReader::new(reader).lines();
+    fn truncate_nick(s: &str) -> String { s.chars().take(9).collect() }
+    let mut nick = truncate_nick(&cfg.effective_nick(&me_nick));
+    let mut my_nick = nick.clone();
+    let user = truncate_nick(&me_nick);
+    let real = "Comic Chat RS";
+    let send_line = async |w: &mut tokio::io::WriteHalf<BoxStream>, s: &str| { let owned = sanitize_outgoing_line(s); let s = owned.as_str(); crate::log::info("irc", format!("OUT {}", crate::log::preview_redacted(s))); let _ = w.write_all(format!("{s}\r\n").as_bytes()).await; let _ = w.flush().await; };
+    if cfg.sasl.is_some() { crate::log::debug("irc", format!("SASL configured for {} user={:?} — sending CAP LS 302 first, password is never logged", server_name, cfg.sasl.as_ref().map(|s| s.user.clone()))); send_line(&mut writer, "CAP LS 302").await; }
+    crate::log::debug("irc", format!("IRC handshake: NICK {nick} / USER {user} for {} — waiting for 001 welcome", server_name));
+    send_line(&mut writer, &format!("NICK {nick}")).await;
+    send_line(&mut writer, &format!("USER {user} 0 * :{real}")).await;
+    let mut sasl_started = false;
+    let mut welcomed = false;
+    let mut pending_joins: Vec<String> = cfg.channels.clone();
+    // Channels we are currently in (from our own JOIN echoes) — CTCP
+    // AWAY goes to all of these. Standard AWAY goes to the server.
+    let mut joined_channels: Vec<String> = Vec::new();
+    // Channels we sent JOIN for but have not yet seen our own JOIN echo
+    // for. Used to recognise our own echo when the server truncated /
+    // changed our nick (the echo nick then differs from my_nick).
+    let mut join_sent: Vec<String> = Vec::new();
+    // Our own away message, if we are away. Used to tell joiners
+    // (private CTCP AWAY) and to re-announce on our own JOIN.
+    let mut self_away: Option<String> = None;
+    // 0.3.17: Connected is sent only on 001, not on TCP/TLS connect.
+
+    // Helper: prepend pose code to outgoing text (if any). Returns wire text.
+    // Leading form: "(#GxxxExxxM1) text" — matches parse_pose_code leading handling + OEC leading form.
+    let with_pose = |text: &str, pose: &str| -> String {
+        let p = pose.trim();
+        if p.is_empty() { text.to_string() } else { format!("{p} {text}") }
+    };
+
+    loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(IrcCommand::SendMessage { channel, text, pose_code }) => {
+                        crate::log::debug("irc", format!("OUT SendMessage to {channel} pose={pose_code:?} preview={:?}", crate::log::preview_redacted(&text)));
+                        // Step 1 (0.3.17, review 3.9) defense in depth: app.rs already
+                        // blocks unknown slash commands, but SendMessage must never
+                        // send one as PRIVMSG even if a future caller bypasses app.rs.
+                        // Only "/me <text>" and "/join <channel>" are understood here.
+                        // Anything else starting with '/' is dropped without logging
+                        // its args (they may contain a password) and without emitting
+                        // a Message event.
+                        let slash_blocked = text.starts_with('/') && {
+                            let cmd_name = text.split_whitespace().next().unwrap_or("/");
+                            let has_arg = text.splitn(2, ' ').nth(1).map(|a| !a.trim().is_empty()).unwrap_or(false);
+                            !((cmd_name.eq_ignore_ascii_case("/me") || cmd_name.eq_ignore_ascii_case("/join")) && has_arg)
+                        };
+                        if slash_blocked {
+                            crate::log::warn("irc", format!("SendMessage: blocked unknown slash command {:?} — not sent", text.split_whitespace().next().unwrap_or("/")));
+                        } else if text.eq_ignore_ascii_case("/me") { /* bare /me — ignore */ } else if let Some(action) = me_arg(&text) {
+                            let wire = with_pose(action, &pose_code);
+                            send_line(&mut writer, &format!("PRIVMSG {channel} :\x01ACTION {wire}\x01")).await;
+                            send_ev(IrcEvent::Action { server: server_name.clone(), channel, nick: nick.clone(), text: wire, is_me: true });
+                        } else if let Some(join) = join_arg(&text) {
+                            // join_arg is case-insensitive; normalize handles empty/bare -> ignore.
+                            if let Some(ch) = normalize_join_channel(join) {
+                                join_sent.push(ch.clone());
+                                send_line(&mut writer, &format!("JOIN {ch}")).await;
+                            }
+                        } else {
+                            let wire = with_pose(&text, &pose_code);
+                            send_line(&mut writer, &format!("PRIVMSG {channel} :{wire}")).await;
+                            send_ev(IrcEvent::Message { server: server_name.clone(), channel, nick: nick.clone(), text: wire, is_me: true, kind: crate::comic::MessageKind::Say });
+                        }
+                    }
+                    Some(IrcCommand::Think { channel, text, pose_code }) => {
+                        crate::log::debug("irc", format!("OUT Think to {channel} pose={pose_code:?} preview={:?}", crate::log::preview(&text)));
+                        let wire = with_pose(&format!("*thinks* {text}"), &pose_code);
+                        send_line(&mut writer, &format!("PRIVMSG {channel} :{wire}")).await;
+                        send_ev(IrcEvent::Message { server: server_name.clone(), channel, nick: nick.clone(), text: wire, is_me: true, kind: crate::comic::MessageKind::Think });
+                    }
+                    Some(IrcCommand::Whisper { target, text, pose_code }) => {
+                        crate::log::debug("irc", format!("OUT Whisper to {target} pose={pose_code:?} preview={:?} — private, not to channel", crate::log::preview(&text)));
+                        let wire = with_pose(&text, &pose_code);
+                        send_line(&mut writer, &format!("PRIVMSG {target} :{wire}")).await;
+                        send_ev(IrcEvent::Message { server: server_name.clone(), channel: target.clone(), nick: nick.clone(), text: format!("(whisper to {target}) {wire}"), is_me: true, kind: crate::comic::MessageKind::Whisper });
+                    }
+                    Some(IrcCommand::Action { channel, text, pose_code }) => {
+                        crate::log::debug("irc", format!("OUT Action (CTCP) to {channel} pose={pose_code:?} preview={:?}", crate::log::preview(&text)));
+                        let wire = with_pose(&text, &pose_code);
+                        send_line(&mut writer, &format!("PRIVMSG {channel} :\x01ACTION {wire}\x01")).await;
+                        send_ev(IrcEvent::Action { server: server_name.clone(), channel, nick: nick.clone(), text: wire, is_me: true });
+                    }
+                    Some(IrcCommand::AppearsAs { channel, line }) => {
+                        crate::log::debug("irc", format!("OUT AppearsAs to {channel}: preview={:?} — tells peers our AVB character + URL", crate::log::preview(&line)));
+                        send_line(&mut writer, &format!("PRIVMSG {channel} :{line}")).await;
+                        // Echo locally as an AppearsAs event so our own character updates in UI
+                        if let Some((character, url)) = parse_appears_as(&line) {
+                            send_ev(IrcEvent::AppearsAs { server: server_name.clone(), channel, nick: nick.clone(), character, url });
+                        }
+                    }
+                    Some(IrcCommand::BackgroundAs { channel, line }) => {
+                        crate::log::debug("irc", format!("OUT BackgroundAs to {channel}: preview={:?}", crate::log::preview(&line)));
+                        send_line(&mut writer, &format!("PRIVMSG {channel} :{line}")).await;
+                        if let Some((bg, url)) = parse_background_as(&line) {
+                            send_ev(IrcEvent::BackgroundAs { server: server_name.clone(), channel, nick: nick.clone(), background: bg, url });
+                        }
+                    }
+                    Some(IrcCommand::Join { channel }) => { crate::log::info("irc", format!("OUT JOIN {channel} on {}", server_name)); send_line(&mut writer, &format!("JOIN {channel}")).await; }
+                    Some(IrcCommand::Part { channel }) => { crate::log::info("irc", format!("OUT PART {channel} on {}", server_name)); send_line(&mut writer, &format!("PART {channel}")).await; }
+                    Some(IrcCommand::Quit { reason }) => { crate::log::info("irc", format!("OUT QUIT on {} reason={:?}", server_name, crate::log::preview(&reason))); send_line(&mut writer, &format!("QUIT :{reason}")).await; break; }
+                    Some(IrcCommand::SetAway { message }) => {
+                        // Bundle: standard AWAY to the server + Microsoft
+                        // CTCP AWAY to every joined channel (CoffeeCupAway.mrc
+                        // sendallchan). Back = bare AWAY / bare CTCP AWAY.
+                        crate::log::info("irc", format!("OUT SetAway on {} message={:?} channels={:?}", server_name, message.as_deref().map(crate::log::preview), joined_channels));
+                        self_away = message.clone();
+                        match &message {
+                            Some(m) => send_line(&mut writer, &format!("AWAY :{m}")).await,
+                            None => send_line(&mut writer, "AWAY").await,
+                        }
+                        for ch in &joined_channels {
+                            match &message {
+                                Some(m) => send_line(&mut writer, &format!("PRIVMSG {ch} :\x01AWAY {m}\x01")).await,
+                                None => send_line(&mut writer, &format!("PRIVMSG {ch} :\x01AWAY\x01")).await,
+                            }
+                        }
+                    }
+                    Some(IrcCommand::VersionQuery { target }) => {
+                        crate::log::info("irc", format!("OUT VersionQuery to {target} on {}", server_name));
+                        send_line(&mut writer, &format!("PRIVMSG {target} :\x01VERSION\x01")).await;
+                    }
+                    None => break,
+                }
+            }
+            line = lines.next_line() => {
+                let line = match line { Ok(Some(l)) => l, Ok(None) => { crate::log::warn("irc", format!("IN {}: server closed connection (EOF) — disconnecting", server_name)); break; }, Err(e) => { crate::log::error("irc", format!("IN {}: read error {e} — disconnecting", server_name)); break; } };
+                crate::log::info("irc", format!("IN {} raw preview={:?}", server_name, crate::log::preview(&line)));
+                if let Some(token) = line.strip_prefix("PING ") { crate::log::trace("irc", format!("IN PING token={:?} — replying PONG", crate::log::preview(token))); send_line(&mut writer, &format!("PONG {token}")).await; continue; }
+                if line.contains(" 353 ") {
+                    if let Some(after) = line.split(" :").last() {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 5 {
+                            let channel = parts[4].to_string();
+                            // NAMES prefixes: @ = op (host), + % ~ & = other
+                            // modes. Ops are tracked separately so the
+                            // member list can draw the hammer icon.
+                            let mut members: Vec<String> = Vec::new();
+                            let mut ops: Vec<String> = Vec::new();
+                            for n in after.split_whitespace() {
+                                let bare = n.trim_start_matches(['@', '+', '%', '~', '&']).to_string();
+                                if n.starts_with('@') { ops.push(bare.clone()); }
+                                members.push(bare);
+                            }
+                            send_ev(IrcEvent::Members { server: server_name.clone(), channel, members, ops });
+                        }
+                    }
+                    continue;
+                }
+                if line.contains(" JOIN ") {
+                    if let Some((prefix, rest)) = line.split_once(' ') {
+                        let join_nick = prefix.trim_start_matches(':').split('!').next().unwrap_or("").to_string();
+                        let channel = rest.split_whitespace().nth(1).unwrap_or("").trim_start_matches(':').to_string();
+                        // Our own JOIN echo, even if the server truncated /
+                        // changed our nick: we sent JOIN for this channel and
+                        // have not yet seen our own echo, and the echo nick
+                        // is a prefix of our configured nick (truncation).
+                        let is_own_join = join_nick == my_nick
+                            || (join_sent.contains(&channel) && !joined_channels.contains(&channel) && my_nick.starts_with(&join_nick));
+                        if is_own_join {
+                            // Server changed our nick (truncation). Adopt it.
+                            if join_nick != my_nick {
+                                crate::log::info("irc", format!("IN JOIN echo on {} — server assigned nick {join_nick:?} (configured {my_nick:?})", server_name));
+                                nick = join_nick.clone();
+                                my_nick = join_nick.clone();
+                                send_ev(IrcEvent::MyNick { server: server_name.clone(), nick: join_nick.clone() });
+                            }
+                            join_sent.retain(|c| c != &channel);
+                            if !joined_channels.contains(&channel) { joined_channels.push(channel.clone()); }
+                            // mIRC Away.mrc on-me-join: re-announce away
+                            // to the channel so newcomers see the cup.
+                            if let Some(msg) = &self_away {
+                                send_line(&mut writer, &format!("PRIVMSG {channel} :\x01AWAY {msg}\x01")).await;
+                            }
+                            send_ev(IrcEvent::Joined { server: server_name.clone(), channel: channel.clone() });
+                        }
+                        else {
+                            // mIRC Away.mrc on-join: if WE are away, tell
+                            // the joiner privately so they see our cup.
+                            if let Some(msg) = &self_away {
+                                send_line(&mut writer, &format!("PRIVMSG {join_nick} :\x01AWAY {msg}\x01")).await;
+                            }
+                            send_ev(IrcEvent::MemberJoined { server: server_name.clone(), channel, nick: join_nick });
+                        }
+                    }
+                    continue;
+                }
+                if line.contains(" PART ") {
+                    if let Some((prefix, rest)) = line.split_once(' ') {
+                        let part_nick = prefix.trim_start_matches(':').split('!').next().unwrap_or("").to_string();
+                        let channel = rest.split_whitespace().nth(1).unwrap_or("").to_string();
+                        if part_nick == my_nick { joined_channels.retain(|c| c != &channel); send_ev(IrcEvent::Parted { server: server_name.clone(), channel: channel.clone() }); }
+                        else { send_ev(IrcEvent::MemberLeft { server: server_name.clone(), channel, nick: part_nick }); }
+                    }
+                    continue;
+                }
+                if line.contains(" QUIT ") {
+                    if let Some((prefix, _)) = line.split_once(' ') {
+                        let quit_nick = prefix.trim_start_matches(':').split('!').next().unwrap_or("").to_string();
+                        if quit_nick != my_nick { send_ev(IrcEvent::MemberLeft { server: server_name.clone(), channel: String::new(), nick: quit_nick }); }
+                    }
+                    continue;
+                }
+                // NICK — someone (or us) renamed. mIRC Away.mrc moves the
+                // away entry to the new nick; the app does the same for
+                // members / ops / away / character entries.
+                if line.contains(" NICK ") {
+                    if let Some((prefix, rest)) = line.split_once(' ') {
+                        let old_nick = prefix.trim_start_matches(':').split('!').next().unwrap_or("").to_string();
+                        let new_nick = rest.split_whitespace().nth(1).unwrap_or("").trim_start_matches(':').to_string();
+                        if !old_nick.is_empty() && !new_nick.is_empty() {
+                            if old_nick == my_nick { my_nick = new_nick.clone(); nick = new_nick.clone(); send_ev(IrcEvent::MyNick { server: server_name.clone(), nick: new_nick }); }
+                            else { send_ev(IrcEvent::MemberRenamed { server: server_name.clone(), old_nick, new_nick }); }
+                        }
+                    }
+                    continue;
+                }
+                // MODE +o / -o — channel operator (host) change. Only the
+                // single-mode form is handled; multi-mode lines (e.g.
+                // +ov nick nick) are ignored rather than mis-parsed.
+                if line.contains(" MODE ") {
+                    if let Some((_, rest)) = line.split_once(" MODE ") {
+                        let mut parts = rest.split_whitespace();
+                        if let (Some(channel), Some(modes), Some(target)) = (parts.next(), parts.next(), parts.next()) {
+                            match modes {
+                                "+o" => send_ev(IrcEvent::OpChanged { server: server_name.clone(), channel: channel.to_string(), nick: target.to_string(), is_op: true }),
+                                "-o" => send_ev(IrcEvent::OpChanged { server: server_name.clone(), channel: channel.to_string(), nick: target.to_string(), is_op: false }),
+                                _ => {}
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // 301 RPL_AWAY — standard IRC away notice: someone we
+                // messaged (or WHOISed) is away. Treated like a private
+                // CTCP AWAY: the app applies it to every channel we
+                // share with that nick.
+                if line.contains(" 301 ") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 4 {
+                        let target = parts[3].to_string();
+                        let msg = line.splitn(2, " :").nth(1).unwrap_or("").to_string();
+                        send_ev(IrcEvent::Away { server: server_name.clone(), channel: String::new(), nick: target, message: Some(msg) });
+                    }
+                    continue;
+                }
+                if line.contains("CAP * LS") && cfg.sasl.is_some() && !sasl_started {
+                    if line.contains("sasl") { send_line(&mut writer, "CAP REQ :sasl").await; } else { send_line(&mut writer, "CAP END").await; }
+                    continue;
+                }
+                if line.contains("CAP * ACK :sasl") { send_line(&mut writer, "AUTHENTICATE PLAIN").await; sasl_started = true; continue; }
+                if line.trim() == "AUTHENTICATE +" {
+                    if let Some(sasl) = &cfg.sasl {
+                        // Password is NEVER logged, and the base64 blob is never logged either
+                        // (it decodes to \0user\0pass). Log only that we are sending it.
+                        crate::log::debug("irc", format!("SASL: server sent AUTHENTICATE + — sending AUTHENTICATE PLAIN for user={:?} (password not logged, base64 not logged)", sasl.user));
+                        let raw = format!("\0{}\0{}", sasl.user, sasl.pass);
+                        let b64 = base64_encode(raw.as_bytes());
+                        send_line(&mut writer, &format!("AUTHENTICATE {b64}")).await;
+                    } else {
+                        crate::log::warn("irc", format!("SASL: server sent AUTHENTICATE + but no SASL config for {} — ignoring", server_name));
+                    }
+                    continue;
+                }
+                if line.contains("903") || line.contains("904") || line.contains("905") { send_line(&mut writer, "CAP END").await; continue; }
+                if line.contains("CAP * ACK") && !line.contains("sasl") { send_line(&mut writer, "CAP END").await; continue; }
+                // CTCP ACTION incoming
+                if line.contains("PRIVMSG") && line.contains("\x01ACTION") {
+                    if let Some((prefix, rest)) = line.split_once(" PRIVMSG ") {
+                        let nick2 = prefix.trim_start_matches(':').split('!').next().unwrap_or("").to_string();
+                        let mut parts = rest.splitn(2, " :");
+                        let channel2 = parts.next().unwrap_or("").to_string();
+                        let payload = parts.next().unwrap_or("").trim_end_matches("\x01").trim_start_matches("\x01ACTION ").to_string();
+                        send_ev(IrcEvent::Action { server: server_name.clone(), channel: channel2, nick: nick2, text: strip_irc_formatting(&payload), is_me: false });
+                    }
+                    continue;
+                }
+                // NOTICE — CTCP VERSION replies arrive as NOTICE, not PRIVMSG.
+                // `:nick!user@host NOTICE <target> :\x01VERSION <version>\x01`
+                // Other NOTICEs (server notices, etc.) are ignored.
+                if line.contains(" NOTICE ") && line.contains("\x01VERSION") {
+                    if let Some((prefix, rest)) = line.split_once(" NOTICE ") {
+                        let sender = prefix.trim_start_matches(':').split('!').next().unwrap_or("").to_string();
+                        if let Some(payload) = rest.splitn(2, " :").nth(1) {
+                            let payload = payload.trim().trim_matches('\x01');
+                            if let Some(version) = payload.strip_prefix("VERSION ").or(if payload == "VERSION" { Some("") } else { None }) {
+                                send_ev(IrcEvent::VersionReply { server: server_name.clone(), nick: sender, version: version.to_string() });
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // PRIVMSG — check Appears as / Background as FIRST, before treating as speech
+                if let Some((target, sender, payload, is_ctcp)) = parse_privmsg(&line) {
+                    crate::log::trace("irc", format!("IN PRIVMSG from {sender} to {target} on {} preview={:?}", server_name, crate::log::preview(&payload)));
+                    let trimmed = payload.trim();
+                    if let Some((character, url)) = parse_appears_as(trimmed) {
+                        send_ev(IrcEvent::AppearsAs { server: server_name.clone(), channel: target.clone(), nick: sender, character, url });
+                        continue;
+                    }
+                    if let Some((bg, url)) = parse_background_as(trimmed) {
+                        send_ev(IrcEvent::BackgroundAs { server: server_name.clone(), channel: target.clone(), nick: sender, background: bg, url });
+                        continue;
+                    }
+                    // CTCP VERSION — direct query only (target is our nick).
+                    // A VERSION sent to a channel would make every client
+                    // reply at once, so channel-targeted VERSION is ignored.
+                    // Reply is a NOTICE with the exact string
+                    // `Open Comic Chat (Version 0.3.17)` from crate::version_reply_with().
+                    if is_ctcp && target == my_nick && (trimmed == "VERSION" || trimmed.starts_with("VERSION ")) {
+                        crate::log::debug("irc", format!("IN CTCP VERSION from {sender} on {} — replying NOTICE with version reply", server_name));
+                        send_line(&mut writer, &format!("NOTICE {sender} :\x01VERSION {}\x01", crate::version_reply_with(ctcp_version.as_deref()))).await;
+                        continue;
+                    }
+                    // CTCP AWAY (Microsoft Comic Chat, nonstandard) —
+                    // see CoffeeCupAway.mrc. `AWAY <msg>` = away, bare
+                    // `AWAY` = back. Channel-targeted applies to that
+                    // channel; private (target is our nick) applies to
+                    // every channel we share with the sender (the app
+                    // resolves it). Must come before the whisper branch
+                    // or a private AWAY would show up as a whisper.
+                    if is_ctcp && (trimmed == "AWAY" || trimmed.starts_with("AWAY ")) {
+                        let msg = trimmed.strip_prefix("AWAY ").map(|s| s.to_string());
+                        let ch = if target == my_nick { String::new() } else { target.clone() };
+                        crate::log::debug("irc", format!("IN CTCP AWAY from {sender} on {} channel={ch:?} message={msg:?} — coffee cup", server_name));
+                        send_ev(IrcEvent::Away { server: server_name.clone(), channel: ch, nick: sender, message: msg });
+                        continue;
+                    }
+                    // Think marker
+                    if trimmed.starts_with("*thinks* ") {
+                        // Keep the *thinks* marker in the event text so comic.rs strips it for display
+                        // but the kind is Think.
+                        send_ev(IrcEvent::Message { server: server_name.clone(), channel: target, nick: sender, text: strip_irc_formatting(&payload), is_me: false, kind: crate::comic::MessageKind::Think });
+                        continue;
+                    }
+                    // If target is our nick, it's a whisper (DM) — show as Whisper in that DM view
+                    if target == my_nick {
+                        send_ev(IrcEvent::Message { server: server_name.clone(), channel: sender.clone(), nick: sender, text: strip_irc_formatting(&payload), is_me: false, kind: crate::comic::MessageKind::Whisper });
+                        continue;
+                    }
+                    send_ev(IrcEvent::Message { server: server_name.clone(), channel: target, nick: sender, text: strip_irc_formatting(&payload), is_me: false, kind: crate::comic::MessageKind::Say });
+                    continue;
+                }
+                if (line.contains(" 432 ") || line.contains(" 433 ")) && !welcomed {
+                    let retry = format!("{}_", nick.chars().take(8).collect::<String>());
+                    crate::log::info("irc", format!("IN {} nick rejected (432/433) for {nick} - retrying as {retry}", server_name));
+                    nick = retry.clone(); my_nick = retry.clone();
+                    send_line(&mut writer, &format!("NICK {nick}")).await;
+                    continue;
+                }
+                if line.contains(" 001 ") && !welcomed {
+                    // Learn our ACTUAL nick from the welcome (:server 001 <nick> :...).
+                    // The server may have truncated / changed the configured nick
+                    // (e.g. a 9-char limit: oarion-tests -> oarion-te). Adopt it
+                    // as our identity so the app never shows us twice.
+                    if let Some(actual) = line.split_whitespace().nth(2).map(|s| s.to_string()) {
+                        if actual != my_nick {
+                            crate::log::info("irc", format!("IN 001 welcome on {} — server assigned nick {actual:?} (configured {my_nick:?})", server_name));
+                            nick = actual.clone();
+                            my_nick = actual.clone();
+                            send_ev(IrcEvent::MyNick { server: server_name.clone(), nick: actual });
+                        }
+                    }
+                    crate::log::info("irc", format!("IN 001 welcome on {} — registered as {nick}, joining {} pending channel(s) {:?}", server_name, pending_joins.len(), pending_joins));
+                    welcomed = true;
+                    send_ev(IrcEvent::Connected { server: server_name.clone() });
+                    for ch in pending_joins.drain(..) {
+                        join_sent.push(ch.clone());
+                        send_line(&mut writer, &format!("JOIN {ch}")).await;
+                        send_ev(IrcEvent::Joined { server: server_name.clone(), channel: ch });
+                    }
+                    continue;
+                }
+                if line.contains(" JOIN ") {
+                    if let Some(ch) = line.split(" JOIN ").nth(1).map(|s| s.trim().trim_start_matches(':').to_string()) {
+                        send_ev(IrcEvent::Joined { server: server_name.clone(), channel: ch });
+                    }
+                    continue;
+                }
+            }
+        }
+    }
+    crate::log::info("irc", format!("run_server ending for {server_name} — connection closed, event Disconnected will be sent"));
+    send_ev(IrcEvent::Disconnected { server: server_name, reason: "connection closed".into() });
+}

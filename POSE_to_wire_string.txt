@@ -1,0 +1,7 @@
+    pub fn to_wire_string(&self, pose_style: &str) -> String {
+        // FIX Wire-Log-File v2: log to real debug.log via crate::log
+        if pose_style == "none" {
+            return String::new();
+        }
+        self.to_code_string()
+    }

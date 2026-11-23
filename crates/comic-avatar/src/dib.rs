@@ -76,8 +76,19 @@ pub fn parse_pose_table(bytes: &[u8]) -> Vec<PoseEntry> {
     out
 }
 
+impl DecodedAvb {
+    /// Wire G for an emotion: 100 * (position of the (Neutral gesture,
+    /// face) entry in this AVB's POSE table) + 10. Per-AVB: Trekkie Coy
+    /// is at position 7 -> G710, Happy at 3 -> G310. Other AVBs differ.
+    /// Returns None when the AVB has no POSE table or no (Neutral, face) entry.
+    pub fn wire_g_for_face(&self, face: u8) -> Option<u16> {
+        if self.poses.is_empty() { return None; }
+        let idx = self.poses.iter().position(|pe| pe.gesture == 0 && pe.expression == face)?;
+        Some((idx as u16) * 100 + 10)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
-#[allow(dead_code)]
 pub struct DecodedAvb {
     pub name: String,
     pub url: Option<String>,
@@ -930,19 +941,28 @@ pub fn decode_avb_bytes(bytes: &[u8], path: &Path) -> Option<DecodedAvb> {
                 for &o in offsets.iter() {
                     if !unique.contains(&o) { unique.push(o); }
                 }
-                let base = if images.len() == unique.len() + 1 { 1usize } else { 0usize };
+                // ICON_FIX_0317: extra image (icon) is the smallest by area,
+                // not necessarily at images[0]. If images has one extra vs
+                // unique, find icon_idx (smallest) and skip it when mapping.
+                // Trekkie: icon at end, base=1 shifted every pose by one (Coy->Sad).
+                let icon_idx = if images.len() == unique.len() + 1 {
+                    images.iter().enumerate().min_by_key(|(_, im)| (im.width as usize) * (im.height as usize)).map(|(idx, _)| idx)
+                } else { None };
                 for (i, unk1) in unk1s.iter().enumerate() {
                     let uidx = unique.iter().position(|&u| u == offsets[i]).unwrap_or(i);
-                    let img_idx = base + uidx;
+                    let img_idx = if let Some(k) = icon_idx { if uidx >= k { uidx + 1 } else { uidx } } else { uidx };
                     if img_idx >= images.len() { break; }
                     let (g, e) = unk1_to_pose(*unk1);
                     poses.push(PoseEntry { gesture: g, expression: e, image_index: img_idx });
                 }
             } else {
                 // Fallback: old 1:1 mapping if offsets don't match (should not happen)
-                let offset = if images.len() == unk1s.len() + 1 { 1 } else { 0 };
+                // Same icon-by-size fix as above.
+                let icon_idx2 = if images.len() == unk1s.len() + 1 {
+                    images.iter().enumerate().min_by_key(|(_, im)| (im.width as usize) * (im.height as usize)).map(|(idx, _)| idx)
+                } else { None };
                 for (i, unk1) in unk1s.iter().enumerate() {
-                    let img_idx = i + offset;
+                    let img_idx = if let Some(k) = icon_idx2 { if i >= k { i + 1 } else { i } } else { i };
                     if img_idx >= images.len() { break; }
                     let (g, e) = unk1_to_pose(*unk1);
                     poses.push(PoseEntry { gesture: g, expression: e, image_index: img_idx });
@@ -1015,4 +1035,15 @@ mod cleanup_0317_dib_kept {
         let d = decode_avb_bytes(b"", std::path::Path::new("x.avb"));
         assert!(d.map(|d| d.images.is_empty()).unwrap_or(true));
     }
+}
+
+// G-as-POSE-index: gesture entry is 25 bytes, index by G (POSE index).
+// file_emotion = entry[12] as u16, face_x = u16 at 14 / 256, face_y = u16 at 16 / 256
+// Do not dedup by offset; entries 1/2 etc. share offsets but differ in file emotion.
+pub fn gesture_entry_for_pose_index(data: &[u8], gesture_off: usize, pose_index: usize) -> Option<[u8; 25]> {
+    let off = gesture_off.checked_add(pose_index.checked_mul(25)?)?;
+    let e = data.get(off..off+25)?;
+    let mut out = [0u8; 25];
+    out.copy_from_slice(e);
+    Some(out)
 }

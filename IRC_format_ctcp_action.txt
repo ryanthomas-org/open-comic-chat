@@ -1,0 +1,1 @@
+pub fn format_ctcp_action(target: &str, text: &str) -> String { let d = 1 as char; format!("PRIVMSG {} :{}ACTION {}{}", target.trim(), d, text, d) }

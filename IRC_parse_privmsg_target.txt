@@ -1,0 +1,1 @@
+pub fn parse_privmsg_target(s: &str) -> String { let parts: Vec<&str> = s.split_whitespace().collect(); if parts.len() >= 3 && parts[1] == "PRIVMSG" { return parts[2].to_string(); } "".to_string() }
