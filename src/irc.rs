@@ -5,6 +5,7 @@
 // - Think:  PRIVMSG #ch :*thinks* text
 // - Whisper: PRIVMSG <nick> :text
 // - Action: PRIVMSG #ch :\x01ACTION text\x01
+        // FIX P1: AppearsAs whisper is AppearsAs, not a whisper panel. MS Chat whispers HUGH to joiner (PRIVMSG oarion07 :# Appears as HUGH). Handle it as AppearsAs even when target is a nick, not #channel.
 // - Character: PRIVMSG #ch :# Appears as Name.http://.../Name.AVB  (sent on JOIN + whenever a new user joins, so they learn our character)
 // - Background: PRIVMSG #ch :# Background as Name.http://.../Name.BGB (share, optional)
 // pose_style="old" (default): Say prepends OldAngle (#GxxxExxxM1) computed from wheel+text. pose_style="none": plain text, no code.
@@ -89,7 +90,9 @@ async fn connect_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
     crate::log::debug("irc", format!("DNS lookup: {host}:{port} — resolving host to addresses"));
     let addrs: Vec<std::net::SocketAddr> = match lookup_host((host, port)).await {
         Ok(it) => it.collect(),
-        Err(e) => { crate::log::error("irc", format!("DNS lookup failed for {host}:{port}: {e} — check host spelling, DNS, and network. No TCP attempt was made.")); return Err(e); }
+        Err(e) => {
+        // FIX P1: protocol wire is "(#G...) text". Wrap pose_code once here too (idempotent with app.rs).
+ crate::log::error("irc", format!("DNS lookup failed for {host}:{port}: {e} — check host spelling, DNS, and network. No TCP attempt was made.")); return Err(e); }
     };
     crate::log::debug("irc", format!("DNS lookup succeeded for {host}:{port}: {} address(es) {:?}", addrs.len(), addrs));
     if addrs.is_empty() { crate::log::error("irc", format!("DNS: no addresses for {host} — lookup returned empty, cannot connect")); return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("DNS: no addresses for {host}"))); }
@@ -157,7 +160,9 @@ pub async fn run_server(cfg: ServerConfig, me_nick: String, mut cmd_rx: mpsc::Un
     // Leading form: "(#GxxxExxxM1) text" — matches parse_pose_code leading handling + OEC leading form.
     let with_pose = |text: &str, pose: &str| -> String {
         let p = pose.trim();
-        if p.is_empty() { text.to_string() } else { format!("{p} {text}") }
+        if p.is_empty() { text.to_string() }
+        else if p.starts_with("(#") { format!("{p} {text}") }
+        else { format!("(#{p}) {text}") }
     };
 
     loop {
@@ -165,6 +170,8 @@ pub async fn run_server(cfg: ServerConfig, me_nick: String, mut cmd_rx: mpsc::Un
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(IrcCommand::SendMessage { channel, text, pose_code }) => {
+                        // Wire is "(#G...) text" - MS Chat sends wrapped. with_pose wraps once.
+
                         crate::log::debug("irc", format!("OUT SendMessage to {channel} pose={pose_code:?} preview={:?}", crate::log::preview_redacted(&text)));
                         // Step 1 (0.3.17, review 3.9) defense in depth: app.rs already
                         // blocks unknown slash commands, but SendMessage must never
@@ -206,7 +213,15 @@ pub async fn run_server(cfg: ServerConfig, me_nick: String, mut cmd_rx: mpsc::Un
                         crate::log::debug("irc", format!("OUT Whisper to {target} pose={pose_code:?} preview={:?} — private, not to channel", crate::log::preview(&text)));
                         let wire = with_pose(&text, &pose_code);
                         send_line(&mut writer, &format!("PRIVMSG {target} :{wire}")).await;
-                        send_ev(IrcEvent::Message { server: server_name.clone(), channel: target.clone(), nick: nick.clone(), text: format!("(whisper to {target}) {wire}"), is_me: true, kind: crate::comic::MessageKind::Whisper });
+                        // FIX: AppearsAs whisper is AppearsAs, not a whisper panel.
+                        // Echo as AppearsAs/BackgroundAs so drain updates char_map only.
+                        if let Some((character, url)) = parse_appears_as(text.trim()) {
+                            send_ev(IrcEvent::AppearsAs { server: server_name.clone(), channel: target.clone(), nick: nick.clone(), character, url });
+                        } else if let Some((bg, url)) = parse_background_as(text.trim()) {
+                            send_ev(IrcEvent::BackgroundAs { server: server_name.clone(), channel: target.clone(), nick: nick.clone(), background: bg, url });
+                        } else {
+                            send_ev(IrcEvent::Message { server: server_name.clone(), channel: target.clone(), nick: nick.clone(), text: format!("(whisper to {target}) {wire}"), is_me: true, kind: crate::comic::MessageKind::Whisper });
+                        }
                     }
                     Some(IrcCommand::Action { channel, text, pose_code }) => {
                         crate::log::debug("irc", format!("OUT Action (CTCP) to {channel} pose={pose_code:?} preview={:?}", crate::log::preview(&text)));

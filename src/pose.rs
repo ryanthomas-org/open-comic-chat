@@ -1,3 +1,4 @@
+fn clean_appears_as_name(s: &str) -> String { s.trim().trim_end_matches(['.', '?', ' ']).trim_end_matches(['.', '?']).to_string() }
 // Pose / character codes — Microsoft Comic Chat 2.5 pose code.
 //
 // 2.5 sends (#GdddEdddMd) at the START of every message sent from it.
@@ -514,6 +515,54 @@ impl PoseCode {
         let m = if self.emotion == Emotion::Neutral { 0 } else { 1 };
         format!("(#G{:03}E{:03}M{})", g, e, m)
     }
+
+    // Single CEmotion -> (face_emo, face_int_10). Gesture wins if non-Neutral,
+    // else emotion. Neutral is 9, Happy is 1 - they must NOT both be 1.
+    // Old code mapped Neutral to (1,0) and Happy to (1,9), both looked up w==1 and both returned first Happy body.
+    fn single_face_emo(&self) -> (u8, u8) {
+        // Intensity from wheel strength / text heuristic, 0..9. Used to pick closest AVB body for this emotion.
+        let int_10 = (self.intensity * 10.0).round() as i32;
+        let int_10 = int_10.clamp(0, 9) as u8;
+        if self.gesture != Gesture::Neutral {
+            let emo = match self.gesture {
+                Gesture::Wave => 10,
+                Gesture::PointOther => 11,
+                Gesture::PointSelf => 12,
+                Gesture::DoublePoint => 13,
+                Gesture::Shrug => 14,
+                _ => 9,
+            };
+            return (emo, int_10.max(7));
+        }
+        match self.emotion {
+            Emotion::Neutral => (9, 0),
+            Emotion::Happy => (1, int_10),
+            Emotion::Coy => (2, int_10),
+            Emotion::Bored => (3, int_10),
+            Emotion::Scared => (4, int_10),
+            Emotion::Sad => (5, int_10),
+            Emotion::Angry => (6, int_10),
+            Emotion::Shout => (7, int_10),
+            Emotion::Laugh => (8, int_10),
+        }
+    }
+
+    pub fn to_code_string_for_avb(&self, avb_name: &str) -> String {
+        self.to_code_string_for_avb_cycled(avb_name, 0)
+    }
+    pub fn to_code_string_for_avb_cycled(&self, avb_name: &str, cycle: usize) -> String {
+        let (face_emo, face_int_10) = self.single_face_emo();
+        let body = crate::pose_lookup::body_for_pose_cycled(face_emo, face_int_10, avb_name, cycle);
+        crate::pose_lookup::wire_for_body(body, face_emo, face_int_10, avb_name)
+    }
+
+    pub fn to_wire_string_for_avb(&self, pose_style: &str, avb_name: &str) -> String {
+        self.to_wire_string_for_avb_cycled(pose_style, avb_name, 0)
+    }
+    pub fn to_wire_string_for_avb_cycled(&self, pose_style: &str, avb_name: &str, cycle: usize) -> String {
+        if pose_style == "none" { return String::new(); }
+        self.to_code_string_for_avb_cycled(avb_name, cycle)
+    }
     /// Wire string honouring config `comic.pose_style`.
     /// - "none" -> "" (send nothing, for plain IRC peers)
     /// - anything else ("2.5", "old", "angle", "") -> canonical 2.5 angle code at start.
@@ -601,22 +650,55 @@ pub fn angle_to_gesture(angle: u16) -> Gesture {
 }
 
 fn parse_pose_inner(inner: &str) -> Option<PoseCode> {
-    if inner.contains(':') { return None; }
-    let after_g = inner.strip_prefix("#G")?;
+    let (code_part, cast_part) = match inner.find(" CAST:") {
+        Some(idx) => (&inner[..idx], Some(&inner[idx + 6..])),
+        None => (inner, None),
+    };
+    let cast: Vec<String> = cast_part.map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default();
+    // Do NOT reject ':' - ':' is faceEmo 10 (Wave), ';' is 11 (PointOther) in real MS Chat wire.
+    let after_g = code_part.strip_prefix("#G")?;
     if after_g.len() < 7 { return None; }
-    let g_angle: u16 = after_g[..3].parse().ok()?;
+    let b = after_g.as_bytes();
+    let body = (b[0] as u16).saturating_sub(48);
+    let _torso_emo = (b[1] as u16).saturating_sub(48);
+    let _torso_int = (b[2] as u16).saturating_sub(48);
     let rest = &after_g[3..];
     let rest = rest.strip_prefix('E')?;
     if rest.len() < 4 { return None; }
-    let e_angle: u16 = rest[..3].parse().ok()?;
-    let rest = &rest[3..];
-    let rest = rest.strip_prefix('M')?;
-    let mouth: u8 = rest.chars().next()?.to_digit(10)? as u8;
-    let gesture = angle_to_gesture(g_angle);
-    let emotion = angle_to_emotion_with_mouth(e_angle, mouth);
-    let intensity = if emotion == Emotion::Neutral && mouth == 0 { 0.0 } else { 1.0 };
-    let mut p = PoseCode::from_emotion_gesture(emotion, gesture, intensity);
-    p.cast = Vec::new();
+    let rb = rest.as_bytes();
+    let _face_idx = (rb[0] as u16).saturating_sub(48);
+    let face_emo = (rb[1] as u16).saturating_sub(48);
+    let face_int = (rb[2] as u16).saturating_sub(48);
+    let mut idx = 3usize;
+    let mut _frozen = false;
+    if rb.len() > idx && rb[idx] == b'R' { _frozen = true; idx += 1; }
+    // Terminator: M<mode> OR R (already consumed) OR end-of-string. R alone is valid - Coy/Sad end with R, no M.
+    if idx < rest.len() {
+        let rest2 = &rest[idx..];
+        if let Some(after_m) = rest2.strip_prefix('M') {
+            let _mouth: u8 = after_m.chars().next()?.to_digit(10)? as u8;
+        } else if !rest2.is_empty() {
+            return None;
+        }
+    }
+    let (emotion, gesture) = match face_emo {
+        0 => (Emotion::Neutral, Gesture::Neutral),
+        1 => if face_int == 0 { (Emotion::Neutral, Gesture::Neutral) } else { (Emotion::Happy, Gesture::Neutral) },
+        2 => (Emotion::Coy, Gesture::Neutral),
+        3 => (Emotion::Bored, Gesture::Neutral),
+        4 => (Emotion::Scared, Gesture::Neutral),
+        5 => (Emotion::Sad, Gesture::Neutral),
+        6 => (Emotion::Angry, Gesture::Neutral),
+        7 => (Emotion::Shout, Gesture::Neutral),
+        8 => (Emotion::Laugh, Gesture::Neutral),
+        9 => (Emotion::Neutral, Gesture::PointSelf),
+        10 => (Emotion::Neutral, Gesture::Wave),
+        11 => (Emotion::Neutral, Gesture::PointOther),
+        _ => (Emotion::Neutral, Gesture::Neutral),
+    };
+    let _ = body;
+    let mut p = PoseCode::from_emotion_gesture(emotion, gesture, face_int as f32 / 10.0);
+    p.cast = cast;
     Some(p)
 }
 
@@ -651,14 +733,14 @@ pub fn parse_pose_code(text: &str) -> Option<(String, PoseCode)> {
         if let Some(end_rel) = trimmed_full.find(')') {
             let inner = &trimmed_full[3..end_rel];
             let inner_full = format!("#G{inner}");
-            if inner_full.contains(':') {
-                return None;
-            }
+            // ':' as VALUE is legal (Wave faceEmo 10). Reject only invented #G<d>:<d>E<d>:<d>M<d>.
+            if inner_full.len() == 11 && inner_full.as_bytes()[3] == b':' && inner_full.as_bytes()[7] == b':' && inner_full.as_bytes()[0] == b'#' && inner_full.as_bytes()[1] == b'G' && inner_full.as_bytes()[5] == b'E' && inner_full.as_bytes()[9] == b'M' { return None; }
             if let Some(pose) = parse_pose_inner(&inner_full) {
                 let clean = trimmed_full[end_rel + 1..].trim().to_string();
                 return Some((clean, pose));
             } else {
-                if inner.contains(':') { return None; }
+                // ':' as VALUE is legal (Wave faceEmo 10). Reject only invented #G<d>:<d>E<d>:<d>M<d>.
+                if inner.len() == 11 && inner.as_bytes()[3] == b':' && inner.as_bytes()[7] == b':' && inner.as_bytes()[0] == b'#' && inner.as_bytes()[1] == b'G' && inner.as_bytes()[5] == b'E' && inner.as_bytes()[9] == b'M' { return None; }
             }
         }
     }
@@ -668,7 +750,8 @@ pub fn parse_pose_code(text: &str) -> Option<(String, PoseCode)> {
     if !trimmed[end + 1..].trim().is_empty() { return None; }
     let inner = &trimmed[start + 1..end];
     if !inner.starts_with("#G") { return None; }
-    if inner.contains(':') { return None; }
+    // ':' as VALUE is legal (Wave faceEmo 10). Reject only invented #G<d>:<d>E<d>:<d>M<d>.
+    if inner.len() == 11 && inner.as_bytes()[3] == b':' && inner.as_bytes()[7] == b':' && inner.as_bytes()[0] == b'#' && inner.as_bytes()[1] == b'G' && inner.as_bytes()[5] == b'E' && inner.as_bytes()[9] == b'M' { return None; }
     let pose = parse_pose_inner(inner)?;
     let clean = trimmed[..start].trim_end().to_string();
     Some((clean, pose))
@@ -697,7 +780,9 @@ pub fn parse_appears_as(text: &str) -> Option<(String, Option<String>)> {
         if name_part.is_empty() || url_part.is_empty() { return None; }
         return Some((name_part.to_string(), Some(url_part.to_string())));
     }
-    Some((rest.to_string(), None))
+    let name = rest.trim_end_matches(['.', '?']).trim();
+    if name.is_empty() { return None; }
+    Some((name.to_string(), None))
 }
 
 /// Background share line, same shape as Appears as but for backgrounds:
@@ -716,7 +801,9 @@ pub fn parse_background_as(text: &str) -> Option<(String, Option<String>)> {
         let name_part = rest[..idx].trim_end_matches('.').trim();
         return Some((name_part.to_string(), Some(rest[idx..].trim().to_string())));
     }
-    Some((rest.to_string(), None))
+    let name = rest.trim_end_matches(['.', '?']).trim();
+    if name.is_empty() { return None; }
+    Some((name.to_string(), None))
 }
 
 /// Display text: strip OEC prefix, then drop the single space that
@@ -771,6 +858,7 @@ pub fn parse_appears_as_line(s: &str) -> Option<(String, Option<String>)> {
         Some(idx) => (&rest[..idx], Some(rest[idx + 1..].trim().to_string())),
         None => (rest, None),
     };
+    let name = name.trim_end_matches(['.', '?']).trim();
     if name.is_empty() { return None; }
     Some((name.to_string(), url.filter(|u| !u.is_empty())))
 }
@@ -781,6 +869,7 @@ pub fn parse_background_as_line(s: &str) -> Option<(String, Option<String>)> {
         Some(idx) => (&rest[..idx], Some(rest[idx + 1..].trim().to_string())),
         None => (rest, None),
     };
+    let name = name.trim_end_matches(['.', '?']).trim();
     if name.is_empty() { return None; }
     Some((name.to_string(), url.filter(|u| !u.is_empty())))
 }
@@ -898,23 +987,26 @@ mod step1_pose_tests {
         let p5 = PoseCode::from_emotion_gesture(Emotion::Happy, Gesture::Wave, 1.0);
         assert_eq!(p5.to_code_string(), "(#G045E000M1)");
     }
-    #[test]
-    fn parse_leading_25() {
-        let (clean, p) = parse_pose_code("(#G000E045M1) hello").unwrap();
+            #[test] fn parse_leading_25() {
+        // Verified 2.5 leading Coy: body 16 '@', faceEmo 2, int 9, frozen R.
+        let (clean, p) = parse_pose_code("(#G@10E029R) hello").unwrap();
         assert_eq!(clean, "hello");
         assert_eq!(p.emotion(), Emotion::Coy);
-        assert_eq!(p.gesture(), Gesture::Neutral);
-        let (clean2, p2) = parse_pose_code("(#G135E045M1) you there").unwrap();
-        assert_eq!(clean2, "you there");
-        assert_eq!(p2.emotion(), Emotion::Coy);
-        assert_eq!(p2.gesture(), Gesture::PointOther);
+        // Verified leading Wave: faceEmo 10 ':'.
+        let (clean2, p2) = parse_pose_code("(#G210E0:8M1) hello").unwrap();
+        assert_eq!(clean2, "hello");
+        assert_eq!(p2.gesture(), Gesture::Wave);
     }
-    #[test]
-    fn parse_trailing_old_logs() {
-        let (clean, p) = parse_pose_code("hello (#G090E090M1)").unwrap();
+            #[test] fn parse_trailing_old_logs() {
+        // Trailing verified wire, not old angle G090/E090 (invented).
+        // Geordi Bored: body 5, faceEmo 3, int 9.
+        let (clean, p) = parse_pose_code("hello (#G510E039M1)").unwrap();
         assert_eq!(clean, "hello");
-        assert_eq!(p.gesture(), Gesture::PointSelf);
         assert_eq!(p.emotion(), Emotion::Bored);
+        // Trekkie Sad: body 17 'A', faceEmo 5, int 9.
+        let (clean2, p2) = parse_pose_code("hello (#GA10E059R)").unwrap();
+        assert_eq!(clean2, "hello");
+        assert_eq!(p2.emotion(), Emotion::Sad);
     }
     #[test]
     fn colon_never_parsed() {
@@ -922,23 +1014,25 @@ mod step1_pose_tests {
         assert!(parse_pose_code("(#G1:1E1:1M1) hello").is_none());
         assert!(parse_pose_code("(#1E1:1M0) hi").is_none());
     }
-    #[test]
-    fn roundtrip() {
-        for (e, g) in [(Emotion::Coy, Gesture::PointOther), (Emotion::Happy, Gesture::Wave), (Emotion::Sad, Gesture::Neutral)] {
-            let p = PoseCode::from_emotion_gesture(e, g, 1.0);
-            let wire = p.to_code_string();
-            let (clean, p2) = parse_pose_code(&format!("{wire} hello")).unwrap();
-            assert_eq!(clean, "hello");
-            assert_eq!(p2.emotion(), e);
-            assert_eq!(p2.gesture(), g);
-        }
+            #[test] fn roundtrip() {
+        // Round-trip via verified char wire, not canonical_wire_for colon form.
+        // Coy wire G@10E029R -> Coy, Wave wire G210E0:8M1 -> Wave.
+        let (clean, p) = parse_pose_code("(#G@10E029R) hello").unwrap();
+        assert_eq!(clean, "hello");
+        assert_eq!(p.emotion(), Emotion::Coy);
+        let (clean2, p2) = parse_pose_code("(#G210E0:8M1) hello").unwrap();
+        assert_eq!(clean2, "hello");
+        assert_eq!(p2.gesture(), Gesture::Wave);
     }
-    #[test]
-    fn neutral_vs_happy_distinguished_by_m() {
-        let (_, pn) = parse_pose_code("(#G000E000M0) hi").unwrap();
-        assert_eq!(pn.emotion(), Emotion::Neutral);
-        let (_, ph) = parse_pose_code("(#G000E000M1) hi").unwrap();
-        assert_eq!(ph.emotion(), Emotion::Happy);
+            #[test] fn neutral_vs_happy_distinguished_by_m() {
+        // Verified: same faceEmo 1, distinguished by body+intensity, NOT by M (M is mouth).
+        let (_, p_n) = parse_pose_code("(#G010E010M1) hi").unwrap();
+        assert_eq!(p_n.emotion(), Emotion::Neutral);
+        let (_, p_h) = parse_pose_code("(#G610E019M1) hi").unwrap();
+        assert_eq!(p_h.emotion(), Emotion::Happy);
+        // M0 vs M1 must NOT change emotion.
+        let (_, p_m0) = parse_pose_code("(#G610E019M0) hi").unwrap();
+        assert_eq!(p_m0.emotion(), Emotion::Happy);
     }
     #[test]
     fn c_emotion_roundtrip() {

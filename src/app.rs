@@ -314,6 +314,7 @@ pub struct ComicChatApp {
     pub about_logo_texture: Option<TextureHandle>,
     pub view_mode: ViewMode,
     pub wheel_emotion: Emotion,
+    pub wheel_gesture: comic::Gesture,
     pub wheel_strength: f32,
     pub wheel_frozen: bool,
     pub neutral_cycle: usize,
@@ -348,6 +349,7 @@ pub struct ComicChatApp {
     pub away_message: Option<String>,
     /// Away message typed in the toolbar field. Default "Gone fishing."
     pub away_input: String,
+    appears_as_sent: std::collections::HashSet<String>,
 }
 
 impl ComicChatApp {
@@ -365,11 +367,12 @@ impl ComicChatApp {
         let (chars, bgs) = scan_comicart();
         crate::log::debug("app", format!("ComicChatApp::new: scan_comicart returned {} char(s) + {} bg(s) — textures will be loaded lazily on first panel draw", chars.len(), bgs.len()));
         let mut app = Self {
+            appears_as_sent: std::collections::HashSet::new(),
             cfg, event_rx, event_tx, handles, control_tx, servers, active_server, active_channel,
             input: String::new(), input_kind: MessageKind::Say, whisper_target: None, panel_cast: Vec::new(),
             my_nick_by_server: HashMap::new(), focus_compose: false, pending_chr_cast: Vec::new(),
             show_servers: false, show_about: false, about_logo_texture: None,
-            view_mode: ViewMode::Comic, wheel_emotion: Emotion::Neutral, wheel_strength: 0.4, wheel_frozen: false, neutral_cycle: 0,
+            view_mode: ViewMode::Comic, wheel_emotion: Emotion::Neutral, wheel_gesture: comic::Gesture::Neutral, wheel_strength: 0.4, wheel_frozen: false, neutral_cycle: 0,
             avb_chars: chars, avb_bgs: bgs, char_textures: HashMap::new(), bg_textures: HashMap::new(),
             save_status: String::new(), copy_status: String::new(), sound_name: String::new(),
             away_message: None, away_input: "Gone fishing.".to_string(),
@@ -445,7 +448,10 @@ impl ComicChatApp {
         // POSE_WHEEL_TEXT_0317: one source of truth. analyze() keeps
         // wheel emotion + text gesture, so preview label, preview image
         // and sent pose all agree. Frozen is handled inside analyze().
-        let (emotion, _balloon, mut gesture, strength) = comic::analyze(&self.input, Some((self.wheel_emotion, self.wheel_strength)), self.wheel_frozen);
+        let (mut emotion, _balloon, mut gesture, strength) = comic::analyze(&self.input, Some((self.wheel_emotion, self.wheel_strength)), self.wheel_frozen);
+        // Wheel gesture buttons: Wave / PointSelf / PointOther picked on wheel win over text gesture.
+        // Single body rule below clears emotion when gesture != Neutral, so this sends the gesture body.
+        if self.wheel_gesture != comic::Gesture::Neutral { gesture = self.wheel_gesture; }
         // Plain Neutral stays Neutral / Neutral here.
         // Distinct neutral images come from ComicMessage.neutral_variant
         // (pose_image_index_seeded), not from cycling Wave / PointSelf /
@@ -454,7 +460,10 @@ impl ComicChatApp {
         // analyze() already handles lol/haha/:/etc for emotion; this
         // overrides gesture only so I -> PointSelf, you -> PointOther
         // even when wheel is frozen.
-        if let (_, Some(g_trig)) = crate::pose::trigger_for_text(&self.input) { gesture = g_trig; }
+        if let (_, Some(g_trig)) = crate::pose::trigger_for_text(&self.input) { if g_trig != comic::Gesture::Neutral { gesture = g_trig; } }
+        // Single CEmotion: one AVB bodyRec per message. Gesture is a CEmotion, not a second axis.
+        // If a gesture is triggered, it wins and emotion is cleared, so Coy+PointSelf is never sent.
+        if gesture != crate::comic::Gesture::Neutral { emotion = Emotion::Neutral; }
         let mut pose = PoseCode::from_emotion_gesture(emotion, gesture, strength);
         // Cast: panel_cast minus self, minus duplicates
         let me = self.my_nick();
@@ -578,15 +587,13 @@ ch.title_pending = false;
                             ch.text_log.push((nick.clone(), format!("* {nick} has joined {channel}")));
                         }
                     }
-                    // 0.3.17 fix: a user who joins AFTER us never saw our
-                    // Appears-as (we only sent it on our own JOIN). Re-send
-                    // it now so the newcomer learns our character. Do not
-                    // send it for our own JOIN (Joined already sent it).
-                    if nick != self.my_nick_for(&server) {
-                        let line = appears_as_line(&self.cfg.comic.character, self.cfg.comic.character_url.as_deref());
-                        let srv = server.clone(); let ch = channel.clone();
-                        self.send_appears_as(&srv, &ch, &line);
-                    }
+                    // FIX AppearsAs dup: do NOT send public AppearsAs on peer JOIN.
+                    // Peer will send their AppearsAs to channel; we reply
+                    // privately via Whisper in the AppearsAs handler below.
+                    // Sending public here + whisper there = 2 outbound
+                    // AppearsAs for one join. Also fixes duplicate public
+                    // on own JOIN when MemberJoined fires for self before
+                    // my_nick is set.
                 }
                 
             IrcEvent::Parted { server, channel } => {
@@ -734,12 +741,15 @@ ch.title_pending = false;
                             }
                         }
                         let ch = s.channels.entry(channel.clone()).or_default();
+                        // Dedupe: MS Chat sends AppearsAs twice. If we already
+                        // know this nick -> same character/url, don't whisper again.
+                        let already_known = ch.char_map.get(&nick).map(|(c, u)| *c == character && *u == url).unwrap_or(false);
                         ch.char_map.insert(nick.clone(), (character.clone(), url.clone()));
                         // Reply privately with our own AppearsAs so the joiner
                         // learns our character. MS Chat does this; without it
                         // a newcomer sees us as silhouette. Private replies
                         // (channel == my) do NOT trigger a reply — no loop.
-                        if nick != my && !channel.eq_ignore_ascii_case(&my) {
+                        if nick != my && !channel.eq_ignore_ascii_case(&my) && !already_known {
                             let (my_char, my_url) = (self.cfg.comic.character.clone(), self.cfg.comic.character_url.clone());
                             // APPEARSAS_0317: use dot format (Name.URL), same as
                             // join announcement. Space format was ignored by
@@ -883,6 +893,26 @@ ch.title_pending = false;
         self.copy_status = format!("Asked {target} for their version…");
     }
 
+
+    // Generic wire from AVB POSE table. Input is the AVB's own poses (dib::PoseEntry), not an avatar name.
+    // Pick entry exactly as pose_image_index_seeded does, then emit its image_index + expression via '0'+n.
+    // This makes preview == wire == panel by construction for any AVB.
+    fn wire_from_poses(poses: &[crate::dib::PoseEntry], emotion: comic::Emotion, gesture: comic::Gesture, strength: f32, frozen: bool) -> Option<String> {
+        if poses.is_empty() { return None; }
+        let g = Self::gesture_index(gesture) as u8;
+        let e = Self::face_index(emotion) as u8;
+        // Wave/PointOther are expressions 10/11 in the wire (see wire-codes-verified.md), not gestures in the POSE table.
+        let want_e = if gesture == comic::Gesture::Wave { 10 } else if gesture == comic::Gesture::PointOther { 11 } else { e };
+        let p = poses.iter().find(|p| p.gesture == g && p.expression == want_e)
+            .or_else(|| poses.iter().find(|p| p.expression == want_e))
+            .or_else(|| poses.iter().find(|p| p.gesture == g))
+            .or_else(|| poses.first())?;
+        let body_c = char::from(48 + (p.image_index as u8));
+        let emo_c = char::from(48 + p.expression);
+        let int_c = char::from(48 + ((strength * 10.0).round() as u8).min(9));
+        let r = if frozen { "R" } else { "" };
+        Some(format!("(#G{}10E0{}{}{}M1)", body_c, emo_c, int_c, r))
+    }
     fn send_current(&mut self) {
         // FIX Wire-Coy: log at send time. See debug.log for WIRE_POSE.
         crate::log::info("WIRE_POSE", format!("send fn=send_current"));
@@ -909,7 +939,9 @@ ch.title_pending = false;
                 crate::log::info("WIRE_POSE", format!("send_current pose={:?}", pose));
             self.pending_chr_cast = self.panel_cast.clone();
             self.panel_cast.clear();
-            let pose_str = pose.to_wire_string(&self.cfg.comic.pose_style);
+            let pose_str = pose.to_wire_string_for_avb_cycled(&self.cfg.comic.pose_style, &self.cfg.comic.character, self.neutral_cycle);
+        // Pose stays bare here. irc.rs with_pose is the single wrapper, so OUT is "(#G...) text" once. Do not wrap here.
+
                 crate::log::info("WIRE_POSE", format!("send_current pose_str={:?}", pose_str));
             let channel = self.active_channel.clone();
             let server = self.active_server.clone();
@@ -931,6 +963,7 @@ ch.title_pending = false;
             if !self.wheel_frozen {
                 self.wheel_emotion = Emotion::Neutral;
                 self.wheel_strength = 0.4;
+            self.wheel_gesture = comic::Gesture::Neutral;
             }
             self.input.clear();
         if __cycle_should_advance { self.neutral_cycle = self.neutral_cycle.wrapping_add(1); } // NEUTRAL_CYCLE_SEND_0317: advance once on send
@@ -1053,7 +1086,7 @@ ch.title_pending = false;
         let server = self.active_server.clone();
         let pose = self.current_pose_code();
             crate::log::info("WIRE_POSE", format!("send_current pose={:?}", pose));
-        let pose_str = pose.to_wire_string(&self.cfg.comic.pose_style);
+        let pose_str = pose.to_wire_string_for_avb_cycled(&self.cfg.comic.pose_style, &self.cfg.comic.character, self.neutral_cycle);
             crate::log::info("WIRE_POSE", format!("send_current pose_str={:?}", pose_str));
         // Cast is on the wire as Tnick in the pose code (see pose.rs
         // to_wire_string) and stored on the local message via the
@@ -1082,7 +1115,7 @@ ch.title_pending = false;
         if !sent {
             crate::log::warn("app", format!("send_current: no IRC handle for {} (not connected) — showing locally as offline demo so panel still renders. Fix: Connect All / check server status, see irc logs for connect failure.", self.active_server));
             // Offline demo: show locally with the same pose code so the panel looks identical
-            let wire = if pose_str.is_empty() { text.clone() } else { format!("{pose_str} {text}") };
+            let wire = if pose_str.is_empty() { text.clone() } else if pose_str.starts_with("(#") { format!("{pose_str} {text}") } else { format!("(#{pose_str}) {text}") }; // FIX P3: pose_str is bare here, wrap once idempotently (offline demo, mirrors with_pose)
                 crate::log::info("WIRE_POSE", format!("send_current wire={:?}", wire));
             let (char_name, char_url) = (self.cfg.comic.character.clone(), self.cfg.comic.character_url.clone());
             let me = self.my_nick();
@@ -1097,6 +1130,7 @@ ch.title_pending = false;
         if !self.wheel_frozen {
             self.wheel_emotion = Emotion::Neutral;
             self.wheel_strength = 0.4;
+            self.wheel_gesture = comic::Gesture::Neutral;
         }
         self.input.clear();
         if __cycle_should_advance { self.neutral_cycle = self.neutral_cycle.wrapping_add(1); } // NEUTRAL_CYCLE_SEND_0317: advance once on send
@@ -1196,7 +1230,7 @@ ch.title_pending = false;
         let channel = self.active_channel.clone();
         let server = self.active_server.clone();
         let pose = self.current_pose_code();
-        let cmd = IrcCommand::SendMessage { channel: channel.clone(), text, pose_code: pose.to_wire_string(&self.cfg.comic.pose_style) };
+        let cmd = IrcCommand::SendMessage { channel: channel.clone(), text, pose_code: pose.to_wire_string_for_avb_cycled(&self.cfg.comic.pose_style, &self.cfg.comic.character, self.neutral_cycle) };
         if let Ok(map) = self.handles.lock() {
             if let Some(tx) = map.get(&server) { let _ = tx.send(cmd); }
         }
@@ -1349,9 +1383,22 @@ ch.title_pending = false;
         let _ = self.control_tx.send(Control::Disconnect(name.to_string()));
         if let Some(s) = self.servers.get_mut(name) { s.connected = false; s.status = "Disconnected".into(); }
     }
+
+    fn should_send_appears_as(&mut self, peer: &str, char_name: &str) -> bool {
+        let key = format!("{}|{}", peer, char_name.trim().trim_end_matches(['.', '?', ' ']).trim_end_matches(['.', '?']));
+        if self.appears_as_sent.contains(&key) { return false; }
+        self.appears_as_sent.insert(key);
+        true
+    }
     fn panels_per_row(&self, avail_w: f32) -> usize {
         if self.cfg.ui.panels_per_row > 0 { return self.cfg.ui.panels_per_row; }
-        if avail_w < 520.0 { 1 } else if avail_w < 900.0 { 2 } else { 3 }
+        // Fixed small panels: fit as many 320-wide panels as fit, never grow to fill row.
+        // Old code capped at 3 and grew panel_w to fill, so panels resized large and spilled early.
+        let fixed = 320.0;
+        let spacing = 8.0;
+        let margin = 16.0;
+        let n = ((avail_w - margin + spacing) / (fixed + spacing)).floor() as usize;
+        n.max(1)
     }
     fn save_conversation(&mut self) {
         let logs = self.servers.get(&self.active_server).and_then(|s| s.channels.get(&self.active_channel)).map(|c| c.text_log.clone()).unwrap_or_default();
@@ -1455,6 +1502,14 @@ ch.title_pending = false;
         if !poses.is_empty() {
             let g = Self::gesture_index(gesture) as u8;
             let e = Self::face_index(emotion) as u8;
+            // Neutral/Neutral: cycle through every Neutral torso in the AVB, one per seed.
+            if e == 0 && g == 0 {
+                let neutrals: Vec<_> = poses.iter().filter(|p| p.gesture == 0 && p.expression == 0).collect();
+                if !neutrals.is_empty() {
+                    let p = neutrals[(msg_seed as usize) % neutrals.len()];
+                    if (p.image_index as usize) < count { return p.image_index as usize; }
+                }
+            }
             if let Some(p) = poses.iter().find(|p| p.gesture == g && p.expression == e) {
                 if p.image_index < count { return p.image_index; }
             }
@@ -2186,7 +2241,7 @@ impl eframe::App for ComicChatApp {
             // Do not use wheel_emotion / gesture_for_emotion here — they ignore
             // input triggers (I / you / caps / !!!) and would show a different pose.
             let preview_pose = self.current_pose_code();
-            let my_tex = self.char_pose_texture(ctx, &my_char, preview_pose.emotion(), preview_pose.gesture());
+            let my_tex = self.char_pose_texture_seeded(ctx, &my_char, preview_pose.emotion(), preview_pose.gesture(), self.neutral_cycle as u64);
             ui.horizontal(|ui| {
                 draw_character_box(ui, &self.cfg.me.nick.clone(), &my_char, preview_pose.emotion(), my_tex, 96.0, 96.0, false, self.cfg.comic.avatar_seed, false);
                 ui.vertical(|ui| {
@@ -2412,7 +2467,10 @@ impl ComicChatApp {
             }
         }
         ui.horizontal(|ui| {
-            if ui.small_button("Neutral").clicked() { self.wheel_emotion = Emotion::Neutral; self.wheel_strength = 0.4; }
+            if ui.small_button("Neutral").clicked() { self.wheel_emotion = Emotion::Neutral; self.wheel_strength = 0.4; self.wheel_gesture = comic::Gesture::Neutral; }
+            if ui.small_button("Wave").clicked() { self.wheel_gesture = comic::Gesture::Wave; }
+            if ui.small_button("PointSelf").clicked() { self.wheel_gesture = comic::Gesture::PointSelf; }
+            if ui.small_button("PointOther").clicked() { self.wheel_gesture = comic::Gesture::PointOther; }
             for e in Emotion::all() {
                 if ui.small_button(e.emoji()).clicked() { self.wheel_emotion = e; }
             }
@@ -2428,7 +2486,7 @@ impl ComicChatApp {
         let total_w = ui.available_width();
         let _ = total_w;
         let _spacing = 8.0;
-        let normal_panel_w = ((total_w - (per_row as f32 - 1.0) * _spacing - 16.0) / per_row as f32).max(240.0); // Step 112: account for row spacing + Frame margins so the row never overflows and clips the 2nd/3rd panel // panel.cpp: ONE fixed 3000x3000 space, scaled uniformly — not window_width/per_row
+        let normal_panel_w = 320.0; // Fixed small, never grow to fill row. per_row is computed from this width.
         // Original: establishing shot is wide but SAME HEIGHT as normal.
         // total_w made the opening panel huge and broke row alignment.
         let wide_panel_w = 320.0; // panel.cpp: no wide pane — establishing is same size, zoom 0.8 only

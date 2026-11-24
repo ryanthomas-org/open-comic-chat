@@ -10,6 +10,8 @@ mod comic;
 mod config;
 mod irc;
 mod pose;
+mod pose_tables;
+mod pose_lookup;
 
 use app::ComicChatApp;
 use config::{default_config_path, load_or_create, ServerConfig};

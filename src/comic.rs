@@ -113,7 +113,12 @@ pub fn analyze(text: &str, wheel: Option<(Emotion, f32)>, frozen: bool) -> (Emot
         // Shouting emotion, which cycled the avatar to a random angry
         // pose (Emotion::Shout, Balloon::Shout, Gesture::PointOther, 1.0). Pose is
         // wheel / pose-code only, never text heuristics.
+        // Caps wins over Wave: HELLO EVERYONE = Shout, hello there = Wave.
         return (Emotion::Neutral, Balloon::Shout, Gesture::Neutral, 0.7);
+    }
+    // HELLO/hi/bye/welcome/howdy -> Wave, only when NOT all caps.
+    if gesture_from_text(&lower, trimmed) == Gesture::Wave {
+        return (Emotion::Neutral, Balloon::Normal, Gesture::Wave, 0.7);
     }
     if lower.contains("rotfl") { return (Emotion::Laugh, Balloon::Normal, Gesture::Wave, 1.0); }
     if lower.contains("lol") || lower.contains("haha") || lower.contains("lmao") { return (Emotion::Laugh, Balloon::Normal, Gesture::Wave, 0.9); }
@@ -136,8 +141,11 @@ fn gesture_from_text(lower: &str, trimmed: &str) -> Gesture {
     if t.starts_with("hello") || t.starts_with("hi ") || t == "hi" || t.starts_with("bye") || t.starts_with("welcome") || t.starts_with("howdy") { return Gesture::Wave; }
     Gesture::Neutral
 }
-pub fn gesture_for_emotion(e: Emotion) -> Gesture {
-    match e { Emotion::Angry => Gesture::Shrug, Emotion::Laugh => Gesture::Wave, Emotion::Happy => Gesture::Wave, Emotion::Shout => Gesture::PointOther, _ => Gesture::Neutral }
+pub fn gesture_for_emotion(_e: Emotion) -> Gesture {
+    // Must stay Neutral: single AVB body per message.
+    // If this returned Wave/Shrug for Happy/Coy, current_pose_code clears emotion to Neutral.
+    // Wheel emotion drives the body; gesture bodies are only via text trigger or wheel_gesture button.
+    Gesture::Neutral
 }
 fn balloon_for_kind(kind: MessageKind, emotion: Emotion, text: &str) -> Balloon {
     match kind {
