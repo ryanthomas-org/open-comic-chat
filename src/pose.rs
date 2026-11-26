@@ -500,15 +500,18 @@ pub struct PoseCode {
     pub gesture: Gesture,
     pub intensity: f32,
     pub cast: Vec<String>,
+    pub frozen: bool,
+    pub body: Option<u8>, // wire body (G<char>) = AVB image index, if from a wire
 }
 
 impl PoseCode {
     pub fn from_emotion_gesture(emotion: Emotion, gesture: Gesture, strength: f32) -> Self {
         let face_index = emotion_angle_index(emotion);
         let torso_index = gesture_index(gesture);
-        Self { face_index, torso_index, requested: false, emotion, gesture, intensity: strength.clamp(0.0, 1.0), cast: Vec::new() }
+        Self { face_index, torso_index, requested: false, emotion, gesture, intensity: strength.clamp(0.0, 1.0), cast: Vec::new(), frozen: false, body: None }
     }
     pub fn with_cast(mut self, cast: Vec<String>) -> Self { self.cast = cast; self }
+    pub fn with_frozen(mut self, frozen: bool) -> Self { self.frozen = frozen; self }
     pub fn to_code_string(&self) -> String {
         let g = gesture_angle_deg(self.gesture);
         let e = emotion_angle_deg(self.emotion);
@@ -547,22 +550,6 @@ impl PoseCode {
         }
     }
 
-    pub fn to_code_string_for_avb(&self, avb_name: &str) -> String {
-        self.to_code_string_for_avb_cycled(avb_name, 0)
-    }
-    pub fn to_code_string_for_avb_cycled(&self, avb_name: &str, cycle: usize) -> String {
-        let (face_emo, face_int_10) = self.single_face_emo();
-        let body = crate::pose_lookup::body_for_pose_cycled(face_emo, face_int_10, avb_name, cycle);
-        crate::pose_lookup::wire_for_body(body, face_emo, face_int_10, avb_name)
-    }
-
-    pub fn to_wire_string_for_avb(&self, pose_style: &str, avb_name: &str) -> String {
-        self.to_wire_string_for_avb_cycled(pose_style, avb_name, 0)
-    }
-    pub fn to_wire_string_for_avb_cycled(&self, pose_style: &str, avb_name: &str, cycle: usize) -> String {
-        if pose_style == "none" { return String::new(); }
-        self.to_code_string_for_avb_cycled(avb_name, cycle)
-    }
     /// Wire string honouring config `comic.pose_style`.
     /// - "none" -> "" (send nothing, for plain IRC peers)
     /// - anything else ("2.5", "old", "angle", "") -> canonical 2.5 angle code at start.
@@ -691,14 +678,16 @@ fn parse_pose_inner(inner: &str) -> Option<PoseCode> {
         6 => (Emotion::Angry, Gesture::Neutral),
         7 => (Emotion::Shout, Gesture::Neutral),
         8 => (Emotion::Laugh, Gesture::Neutral),
-        9 => (Emotion::Neutral, Gesture::PointSelf),
         10 => (Emotion::Neutral, Gesture::Wave),
         11 => (Emotion::Neutral, Gesture::PointOther),
+        12 => (Emotion::Neutral, Gesture::PointSelf),
         _ => (Emotion::Neutral, Gesture::Neutral),
     };
-    let _ = body;
     let mut p = PoseCode::from_emotion_gesture(emotion, gesture, face_int as f32 / 10.0);
     p.cast = cast;
+    // Wire body is the AVB image index the sender chose. Carry it so the
+    // panel renders the exact image, not a seed guess.
+    p.body = Some(body as u8);
     Some(p)
 }
 

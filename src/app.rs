@@ -449,6 +449,14 @@ impl ComicChatApp {
         // wheel emotion + text gesture, so preview label, preview image
         // and sent pose all agree. Frozen is handled inside analyze().
         let (mut emotion, _balloon, mut gesture, strength) = comic::analyze(&self.input, Some((self.wheel_emotion, self.wheel_strength)), self.wheel_frozen);
+        // Freeze: R is emitted iff the sent pose IS the frozen wheel pose.
+        // A text trigger (emotion or gesture) overrides the wheel for this
+        // message, so the sent pose is a one-shot, not the frozen pose.
+        let mut frozen = self.wheel_frozen;
+        if emotion != self.wheel_emotion {
+            // Text emotion trigger (e.g. lol -> Laugh) overrode the wheel.
+            frozen = false;
+        }
         // Wheel gesture buttons: Wave / PointSelf / PointOther picked on wheel win over text gesture.
         // Single body rule below clears emotion when gesture != Neutral, so this sends the gesture body.
         if self.wheel_gesture != comic::Gesture::Neutral { gesture = self.wheel_gesture; }
@@ -460,7 +468,7 @@ impl ComicChatApp {
         // analyze() already handles lol/haha/:/etc for emotion; this
         // overrides gesture only so I -> PointSelf, you -> PointOther
         // even when wheel is frozen.
-        if let (_, Some(g_trig)) = crate::pose::trigger_for_text(&self.input) { if g_trig != comic::Gesture::Neutral { gesture = g_trig; } }
+        if let (_, Some(g_trig)) = crate::pose::trigger_for_text(&self.input) { if g_trig != comic::Gesture::Neutral { gesture = g_trig; frozen = false; } }
         // Single CEmotion: one AVB bodyRec per message. Gesture is a CEmotion, not a second axis.
         // If a gesture is triggered, it wins and emotion is cleared, so Coy+PointSelf is never sent.
         if gesture != crate::comic::Gesture::Neutral { emotion = Emotion::Neutral; }
@@ -470,6 +478,7 @@ impl ComicChatApp {
         let mut cast: Vec<String> = self.panel_cast.iter().filter(|n| *n != &me).cloned().collect();
         cast.sort(); cast.dedup();
         pose = pose.with_cast(cast);
+        pose = pose.with_frozen(frozen);
         pose
     }
 
@@ -897,21 +906,71 @@ ch.title_pending = false;
     // Generic wire from AVB POSE table. Input is the AVB's own poses (dib::PoseEntry), not an avatar name.
     // Pick entry exactly as pose_image_index_seeded does, then emit its image_index + expression via '0'+n.
     // This makes preview == wire == panel by construction for any AVB.
-    fn wire_from_poses(poses: &[crate::dib::PoseEntry], emotion: comic::Emotion, gesture: comic::Gesture, strength: f32, frozen: bool) -> Option<String> {
+    fn wire_from_poses(poses: &[crate::dib::PoseEntry], emotion: comic::Emotion, gesture: comic::Gesture, strength: f32, frozen: bool, seed: u64) -> Option<String> {
         if poses.is_empty() { return None; }
         let g = Self::gesture_index(gesture) as u8;
         let e = Self::face_index(emotion) as u8;
-        // Wave/PointOther are expressions 10/11 in the wire (see wire-codes-verified.md), not gestures in the POSE table.
-        let want_e = if gesture == comic::Gesture::Wave { 10 } else if gesture == comic::Gesture::PointOther { 11 } else { e };
-        let p = poses.iter().find(|p| p.gesture == g && p.expression == want_e)
-            .or_else(|| poses.iter().find(|p| p.expression == want_e))
-            .or_else(|| poses.iter().find(|p| p.gesture == g))
-            .or_else(|| poses.first())?;
+        // Neutral/Neutral: cycle through every Neutral-expression pose, one per seed.
+        // (Same rule as pose_image_index_seeded, so wire == preview == panel.)
+        let p = if emotion == comic::Emotion::Neutral && gesture == comic::Gesture::Neutral {
+            // Strict: Neutral expression AND Neutral gesture, not the icon (image 0).
+            // Loose (expression 0 + not Wave/PointSelf/PointOther) pulled in the icon
+            // pose and scared-looking gesture poses, so the wire cycled
+            // icon/neutral/neutral/scared.
+            let neutrals: Vec<_> = poses.iter().filter(|po| po.expression as u8 == 0 && po.gesture as u8 == 0 && po.image_index != 0).collect();
+            if neutrals.len() > 1 {
+                neutrals[(seed as usize) % neutrals.len()]
+            } else {
+                poses.iter().find(|p| p.gesture == g && p.expression == e)
+                    .or_else(|| poses.iter().find(|p| p.expression == e))
+                    .or_else(|| poses.iter().find(|p| p.gesture == g))
+                    .or_else(|| poses.first())?
+            }
+        } else {
+            poses.iter().find(|p| p.gesture == g && p.expression == e)
+                .or_else(|| poses.iter().find(|p| p.expression == e))
+                .or_else(|| poses.iter().find(|p| p.gesture == g))
+                .or_else(|| poses.first())?
+        };
         let body_c = char::from(48 + (p.image_index as u8));
-        let emo_c = char::from(48 + p.expression);
-        let int_c = char::from(48 + ((strength * 10.0).round() as u8).min(9));
+        // Wire face: gestures and Neutral use fixed MS Chat codes, NOT the
+        // POSE-table expression (which is 0 for all of them). For the 8
+        // emotions, wire face == POSE expression.
+        let face_n: u8 = if gesture == comic::Gesture::Wave { 10 }
+            else if gesture == comic::Gesture::PointSelf { 12 }
+            else if gesture == comic::Gesture::PointOther { 11 }
+            else if emotion == comic::Emotion::Neutral { 1 }
+            else { p.expression };
+        let emo_c = char::from(48 + face_n);
+        // Neutral/Neutral is face 1, int 0 in MS Chat. Face 1 with int > 0
+        // parses as Happy, so force int 0 here (strength must not leak in).
+        let int_c = if emotion == comic::Emotion::Neutral && gesture == comic::Gesture::Neutral { '0' }
+            else { char::from(48 + ((strength * 10.0).round() as u8).min(9)) };
         let r = if frozen { "R" } else { "" };
-        Some(format!("(#G{}10E0{}{}{}M1)", body_c, emo_c, int_c, r))
+        // Bare G...M1; irc.rs with_pose is the single wrapper. Do not wrap here.
+        Some(format!("G{}10E0{}{}{}M1", body_c, emo_c, int_c, r))
+    }
+
+    // Wire for the current pose from the AVB's own POSE table (runtime).
+    // No hard-coded AVB tables. Falls back to the hard-coded path only if
+    // the AVB cannot be found/decoded (temporary; delete after live verify).
+    fn wire_for_pose(&self, pose: &PoseCode) -> String {
+        let emotion = pose.emotion();
+        let gesture = pose.gesture;
+        let strength = pose.intensity;
+        let frozen = pose.frozen;
+        if let Some(avb) = self.avb_chars.iter().find(|f| f.name.eq_ignore_ascii_case(&self.cfg.comic.character)) {
+            if let Some(dec) = crate::dib::decode_avb_file(&avb.path) {
+                if let Some(w) = Self::wire_from_poses(&dec.poses, emotion, gesture, strength, frozen, self.neutral_cycle as u64) {
+                    return w;
+                }
+            }
+        }
+        // No hard-coded fallback. Generic AVB POSE table is the only source.
+        // If the AVB cannot be found/decoded, log and send bare Neutral
+        // rather than silently using a hard-coded table (which sent icon/scared).
+        crate::log::info("WIRE_POSE", format!("wire_for_pose: generic path failed for pose_style={:?}, sending bare Neutral", self.cfg.comic.pose_style));
+        "G010E010M1".to_string()
     }
     fn send_current(&mut self) {
         // FIX Wire-Coy: log at send time. See debug.log for WIRE_POSE.
@@ -939,7 +998,7 @@ ch.title_pending = false;
                 crate::log::info("WIRE_POSE", format!("send_current pose={:?}", pose));
             self.pending_chr_cast = self.panel_cast.clone();
             self.panel_cast.clear();
-            let pose_str = pose.to_wire_string_for_avb_cycled(&self.cfg.comic.pose_style, &self.cfg.comic.character, self.neutral_cycle);
+            let pose_str = self.wire_for_pose(&pose);
         // Pose stays bare here. irc.rs with_pose is the single wrapper, so OUT is "(#G...) text" once. Do not wrap here.
 
                 crate::log::info("WIRE_POSE", format!("send_current pose_str={:?}", pose_str));
@@ -1086,7 +1145,7 @@ ch.title_pending = false;
         let server = self.active_server.clone();
         let pose = self.current_pose_code();
             crate::log::info("WIRE_POSE", format!("send_current pose={:?}", pose));
-        let pose_str = pose.to_wire_string_for_avb_cycled(&self.cfg.comic.pose_style, &self.cfg.comic.character, self.neutral_cycle);
+        let pose_str = self.wire_for_pose(&pose);
             crate::log::info("WIRE_POSE", format!("send_current pose_str={:?}", pose_str));
         // Cast is on the wire as Tnick in the pose code (see pose.rs
         // to_wire_string) and stored on the local message via the
@@ -1230,7 +1289,7 @@ ch.title_pending = false;
         let channel = self.active_channel.clone();
         let server = self.active_server.clone();
         let pose = self.current_pose_code();
-        let cmd = IrcCommand::SendMessage { channel: channel.clone(), text, pose_code: pose.to_wire_string_for_avb_cycled(&self.cfg.comic.pose_style, &self.cfg.comic.character, self.neutral_cycle) };
+        let cmd = IrcCommand::SendMessage { channel: channel.clone(), text, pose_code: self.wire_for_pose(&pose) };
         if let Ok(map) = self.handles.lock() {
             if let Some(tx) = map.get(&server) { let _ = tx.send(cmd); }
         }
@@ -1480,12 +1539,14 @@ ch.title_pending = false;
         // show different neutrals even though gesture stays Neutral.
         if emotion == comic::Emotion::Neutral && gesture == comic::Gesture::Neutral {
             let neutral_code = comic::Emotion::Neutral as u8;
-            let kw = [comic::Gesture::Wave as u8, comic::Gesture::PointSelf as u8, comic::Gesture::PointOther as u8];
             let mut neutrals: Vec<usize> = Vec::new();
             for po in poses {
                 let expr_u8 = po.expression as u8;
                 let gest_u8 = po.gesture as u8;
-                if expr_u8 == neutral_code && !kw.contains(&gest_u8) {
+                // Strict: Neutral expression AND Neutral gesture, not the icon (image 0).
+                // Loose (expression 0 + not Wave/PointSelf/PointOther) pulled in the icon
+                // pose and scared-looking gesture poses.
+                if expr_u8 == neutral_code && gest_u8 == 0 && po.image_index != 0 {
                     neutrals.push(po.image_index as usize);
                 }
             }
@@ -1504,7 +1565,7 @@ ch.title_pending = false;
             let e = Self::face_index(emotion) as u8;
             // Neutral/Neutral: cycle through every Neutral torso in the AVB, one per seed.
             if e == 0 && g == 0 {
-                let neutrals: Vec<_> = poses.iter().filter(|p| p.gesture == 0 && p.expression == 0).collect();
+                let neutrals: Vec<_> = poses.iter().filter(|p| p.gesture == 0 && p.expression == 0 && p.image_index != 0).collect();
                 if !neutrals.is_empty() {
                     let p = neutrals[(msg_seed as usize) % neutrals.len()];
                     if (p.image_index as usize) < count { return p.image_index as usize; }
@@ -1551,6 +1612,27 @@ ch.title_pending = false;
                     let pixels: Vec<Color32> = img.rgba.chunks_exact(4).map(|p| Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])).collect();
                     let cimg = ColorImage { size: [img.width as usize, img.height as usize], pixels };
                     let tex = ctx.load_texture(format!("char-{name}-pose-{idx}-{msg_seed}"), cimg, TextureOptions::default());
+                    self.char_textures.insert(key, tex.clone());
+                    return Some(tex);
+                }
+            }
+        }
+        self.failed_char_textures.insert(key);
+        None
+    }
+    fn char_pose_texture_for_image(&mut self, ctx: &egui::Context, name: &str, image_index: usize) -> Option<TextureHandle> {
+        // Wire body is the exact AVB image index. Load it directly, no seed/cycle.
+        let key = format!("{name}:pose:body:{image_index}");
+        if let Some(t) = self.char_textures.get(&key) { return Some(t.clone()); }
+        if self.failed_char_textures.contains(&key) { return None; }
+        if let Some(avb) = self.avb_chars.iter().find(|f| f.name.eq_ignore_ascii_case(name)) {
+            if let Some(dec) = crate::dib::decode_avb_file(&avb.path) {
+                if !dec.images.is_empty() {
+                    let idx = image_index.min(dec.images.len() - 1);
+                    let img = &dec.images[idx];
+                    let pixels: Vec<Color32> = img.rgba.chunks_exact(4).map(|p| Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])).collect();
+                    let cimg = ColorImage { size: [img.width as usize, img.height as usize], pixels };
+                    let tex = ctx.load_texture(format!("char-{name}-pose-body-{idx}"), cimg, TextureOptions::default());
                     self.char_textures.insert(key, tex.clone());
                     return Some(tex);
                 }
@@ -1634,24 +1716,15 @@ fn draw_character_box(ui: &mut Ui, nick: &str, char_name: &str, emotion: Emotion
             let aspect = aspect.clamp(0.4, 2.5);
             let (resp, painter) = ui.allocate_painter(egui::Vec2::new(slot_w, size), egui::Sense::click());
             let avail = resp.rect;
-            let (dw, dh) = if aspect > 1.0 { (size, size / aspect) } else { (size * aspect, size) };
-            // Torso-up: full sprite at size/0.65, top-aligned, clipped to slot.
-            // Full-body: centred, height = size, aspect preserved.
-            let (dw_torso, dh_torso) = if torso_up {
-                let s = size / 0.65;
-                if aspect > 1.0 { (s, s / aspect) } else { (s * aspect, s) }
-            } else { (dw, dh) };
-            let draw_rect = if torso_up {
-                egui::Rect::from_min_size(egui::Pos2::new(avail.center().x - dw_torso / 2.0, avail.top()), egui::Vec2::new(dw_torso, dh_torso))
-            } else {
-                egui::Rect::from_center_size(avail.center(), egui::Vec2::new(dw, dh))
-            };
+            // FIX 110: No torso-up crop. Original has no torso-up; every avatar is full-body, feet on ground line (panel bottom). Torso-up drew at size/0.65 top-aligned clipped to slot -> shrunken (slot small) + truncated at torso + floating above bottom (head at slot top, feet clipped).
+            // Fit to slot, bottom-aligned: scale down if taller than slot or wider than slot_w, never overflow.
+            let (mut dw, mut dh) = if aspect > 1.0 { (size, size / aspect) } else { (size * aspect, size) };
+            if dh > size { let k = size / dh; dw *= k; dh = size; }
+            if dw > slot_w { let k = slot_w / dw; dw *= k; dh *= k; }
+            let draw_rect = egui::Rect::from_min_size(egui::Pos2::new(avail.center().x - dw / 2.0, avail.bottom() - dh), egui::Vec2::new(dw, dh));
             let mut uv = if flip { egui::Rect::from_min_max(egui::Pos2::new(1.0, 0.0), egui::Pos2::new(0.0, 1.0)) } else { egui::Rect::from_min_max(egui::Pos2::new(0.0, 0.0), egui::Pos2::new(1.0, 1.0)) };
-            // Torso-up: NO UV stretch. Draw full sprite at height
-            // size/0.65, top-aligned, clipped by the painter to the slot.
-            // Visible = top 65% at correct aspect, legs cut, torso to edge.
-            // UV stays full (flip only); draw_rect below handles the crop.
-            let _ = torso_up;
+            // UV stays full (flip only). No crop.
+            let _ = torso_up; // kept in signature, ignored: always full body.
             painter.image(t.id(), draw_rect, uv, Color32::WHITE);
             click_resp = Some(resp.on_hover_text(nick.to_owned()));
         } else {
@@ -2648,18 +2721,39 @@ ui.vertical_centered(|ui| {
                 // Pane grows with content: tall balloon (7 lines) + tail + character
                 // must fit, otherwise the character is cut off at the bottom.
                 // Estimate balloon height from the longest message in this panel.
+                // FIX 110: Panel is a fixed square (original 3000x3000 space scaled uniformly). bg_h = panel_w, never max(panel_w, content_h). Content must sum to panel_w, not grow beyond it (that grew the Frame past the BGB, leaving white space under it).
+                // Total characters = speakers + action actors + silent listeners. Layout used messages.len() only, so with 2+ characters the char row was wider/taller than the bg and overflowed downward.
+                let mut __display_nicks: Vec<String> = Vec::new();
+                for m in &panel.messages { if !__display_nicks.contains(&m.nick) { __display_nicks.push(m.nick.clone()); } }
+                for a in &panel.actions { if !__display_nicks.contains(&a.nick) { __display_nicks.push(a.nick.clone()); } }
+                for m in &panel.messages { for c in &m.cast { if !panel.messages.iter().any(|mm| &mm.nick == c) && !__display_nicks.contains(c) { __display_nicks.push(c.clone()); } } }
+                let total_chars = __display_nicks.len().max(1) as f32;
+                let col_w_total = ((panel_w - 16.0) / total_chars).max(80.0);
+                // LayoutAvatars (panel.cpp): maxBodyHeight = unitHeight/1.9, base width = maxBodyHeight*0.7, reduction if sumWidth>unitWidth else zoom capped 1.666, <1.1 -> 1.0. Use TOTAL chars, not messages.
+                let max_body_h_fix = panel_w / 1.9;
+                let sum_w_fix = max_body_h_fix * 0.7 * total_chars;
+                let char_h_fix = if sum_w_fix > panel_w { max_body_h_fix * (panel_w / sum_w_fix) } else { let mut zf = panel_w / sum_w_fix; zf = zf.min(1.666); if zf < 1.1 { zf = 1.0; } max_body_h_fix * zf };
+                // Balloon height estimate must match draw_balloon actual: lines*20 + pads. Old estimate added +16+22 and omitted tail, so spacer over-estimated and total exceeded bg.
                 let mut balloon_h_est: f32 = 0.0;
                 for mm in &panel.messages {
-                    let col_w_est = ((panel_w - 16.0) / panel.messages.len().max(1) as f32).max(80.0);
-                    let max_w_est = (col_w_est - 32.0).max(60.0).min((0.85 * panel_w - 16.0).max(60.0));
+                    let max_w_est = (col_w_total - 32.0).max(60.0).min((0.85 * panel_w - 16.0).max(60.0));
                     let chars_per_line = (max_w_est / 11.0).max(8.0);
                     let lines_est = ((mm.text.chars().count() as f32 / chars_per_line).ceil() as usize).max(1) as f32;
-                    let h_est = lines_est * 20.0 + 16.0 + 22.0;
+                    let h_est = lines_est * 20.0 + 34.0;
                     if h_est > balloon_h_est { balloon_h_est = h_est; }
                 }
-                let char_h_est = 72.0 * panel.zoom + 36.0;
-                let content_h = 8.0 + balloon_h_est + char_h_est + 8.0 + (panel.actions.len() as f32 * 28.0);
-                let bg_h = panel_w.max(content_h);
+                let actions_h_fix = panel.actions.len() as f32 * 28.0 + if panel.caption.is_some() { 28.0 } else { 0.0 };
+                // Gap from balloon bottom to head = remaining height after balloons + characters + chrome. Tail must span this gap, not fixed 30/70.
+                // FIX PanelOverflow: cap char height so tall balloon + char fit in panel_w.
+                // Without this, gap clamps to 16 and the char row is pushed past the frame (body overflows, torso not cut).
+                let char_h_fix = char_h_fix.min((panel_w - 8.0 - actions_h_fix - balloon_h_est - 16.0).max(40.0));
+                let gap_fix = (panel_w - 8.0 - actions_h_fix - balloon_h_est - char_h_fix).max(16.0);
+                // Head is at the top of the AVB sprite (full-body DIB, head top = slot top).
+                // 0.22 buried the tail tip 22% down inside the opaque head, so the head
+                // covered the tail and the avatar looked like it hovered. 0 ends the
+                // tail at the head top, visible, with no overlap pull-up.
+                let head_offset_fix = 0.0;
+                let bg_h = panel_w;
                 if let Some(tex) = &bg_tex {
                     ui.image((tex.id(), egui::Vec2::new(panel_w, bg_h)));
                     ui.add_space(-bg_h);
@@ -2701,8 +2795,7 @@ ui.vertical_centered(|ui| {
                 // apart sit shoulder-to-shoulder instead of stacking.
                 let mut balloon_y: Vec<f32> = vec![0.0; panel.messages.len()];
                 {
-                    let n = panel.messages.len().max(1) as f32;
-                    let col_w = ((panel_w - 16.0) / n).max(80.0);
+                    let col_w = col_w_total; // FIX 110: same columns as characters (total chars), so each tail lands on its speaker. Old used messages.len(), shifting when actions/listeners present.
                     // Estimate each balloon's x-range from its TEXT width
                     // (GetCloudEstimate: balloon x near speaker's m_arrowX =
                     // column centre, width = text). Column-width overlap never
@@ -2729,13 +2822,23 @@ ui.vertical_centered(|ui| {
                 // Defined once so the spacer below can subtract the same
                 // height the balloon row actually takes (balloon_h_est +
                 // extra_tail), not just balloon_h_est.
-                let extra_tail = if panel.messages.len() <= 1 { 30.0 } else { 70.0 }; // Fig 8-1: tail varies with shot — close-up shorter, wide longer, slender taper
+                // Base tail in draw_balloon: (30*scale).round().max(16), scale = panel_w/640. Tail painter height = balloon_h + base + extra, so extra = gap + head - base or the tip overshoots by base and the panel grows past the BGB.
+                let base_tail_est = (30.0 * (panel_w / 640.0)).round().max(16.0);
+                let extra_tail = gap_fix + head_offset_fix - base_tail_est; // FIX 110: tail spans gap to head (balloon bottom -> head centre), not fixed 30/70. Per-balloon adjustment applied at call site.
+                let _ = extra_tail; // per-balloon tail computed in loop from its own balloon height; global kept as layout check.
                 ui.horizontal_top(|ui| {
                     for (bi, msg) in panel.messages.iter().enumerate() {
-                        let bw = ((panel_w - 16.0) / panel.messages.len().max(1) as f32).max(80.0);
+                        let bw = col_w_total;
                         ui.vertical(|ui| {
                             if balloon_y[bi] > 0.0 { ui.add_space(balloon_y[bi]); }
-                            draw_balloon(ui, msg, bw, panel_w, extra_tail); // extra_tail = ground-line gap, so tail tip lands on head
+                            // FIX 110: per-balloon gap. Short balloons have MORE gap to head than tall ones (max was used for layout), so each tail is sized from its OWN balloon height, not the max. Pushed-down balloons have a shorter gap, so shorten by balloon_y or the tip overshoots into the torso.
+                            let max_w_i = (bw - 32.0).max(60.0).min((0.85 * panel_w - 16.0).max(60.0));
+                            let cpl_i = (max_w_i / 11.0).max(8.0);
+                            let lines_i = ((msg.text.chars().count() as f32 / cpl_i).ceil() as usize).max(1) as f32;
+                            let balloon_h_i = lines_i * 20.0 + 34.0;
+                            let gap_i = (panel_w - 8.0 - actions_h_fix - balloon_h_i - char_h_fix).max(16.0);
+                            let extra_tail_i = (gap_i + head_offset_fix - base_tail_est - balloon_y[bi]).max(16.0);
+                            draw_balloon(ui, msg, bw, panel_w, extra_tail_i); // tail spans gap to head
                         });
                     }
                     if panel.messages.is_empty() {
@@ -2749,29 +2852,10 @@ ui.vertical_centered(|ui| {
                 // panel.cpp GetBalloonRect: balloons in UPPER region, characters
                 // stand on ground line at panel bottom. Without this the
                 // characters float mid-panel (right screenshot).
-                let _balloon_h_est = balloon_h_est;
-                // LayoutAvatars (panel.cpp): maxBodyHeight = unitHeight/1.9,
-                // base width = maxBodyHeight * aspect (avg 0.7, normHeight=100
-                // for all in GetDimInfo), if sumWidth > unitWidth: reduction,
-                // else zoomFactor = unitWidth/sumWidth capped by headFactor
-                // 1.666 (headHeight = height/2), if <1.1 then 1.0.
-                let _max_body_h = bg_h / 1.9;
-                let _n_chars = panel.messages.len().max(1) as f32;
-                let _sum_w = _max_body_h * 0.7 * _n_chars;
-                let _char_h_est = if _sum_w > panel_w {
-                    _max_body_h * (panel_w / _sum_w)
-                } else {
-                    let mut _zf = panel_w / _sum_w;
-                    _zf = _zf.min(1.666);
-                    if _zf < 1.1 { _zf = 1.0; }
-                    _max_body_h * _zf
-                };
-                let _spacer = (bg_h - 8.0 - _balloon_h_est - extra_tail - _char_h_est).max(0.0);
-                ui.add_space(_spacer);
-                // Torso-up slot: fill exactly what is left to the frame edge.
-                // Fixed 150*zoom leaves a gap or overflows by the spacing
-                // the estimate does not count. Full-body keeps 150*zoom.
-                let char_slot_h = ui.available_height().max(50.0);
+                // FIX 110: No spacer. Balloon painter height already includes the gap tail (balloon_h + tail_h). Pull the char row up by head_offset so the tail tip lands ON the head (tail overlaps char row by head_offset), and total stays = panel_w. Old spacer + fixed tail double-counted the gap, leaving white space / floating avatars.
+                // No torso-up: always full body, size = char_h_fix, bottom-aligned in draw_character_box.
+                ui.add_space(-head_offset_fix);
+                let char_slot_h = char_h_fix;
                 let mut display_msgs: Vec<&ComicMessage> = Vec::new();
                 for m in &panel.messages { display_msgs.push(m); }
                 for a in &panel.actions { if !display_msgs.iter().any(|m| m.nick == a.nick) { display_msgs.push(a); } }
@@ -2783,16 +2867,23 @@ ui.vertical_centered(|ui| {
                 // every character fits.
                 let mut all_cast: Vec<&String> = Vec::new();
                 for m in &panel.messages { for c in &m.cast { if !all_cast.contains(&c) { all_cast.push(c); } } }
-                let has_listener = all_cast.iter().any(|c| !display_msgs.iter().any(|m| &m.nick == *c));
-                let torso_up = display_msgs.len() == 1 && panel.actions.is_empty() && !has_listener;
-                let col_w = ((panel_w - 16.0) / panel.messages.len().max(1) as f32).max(80.0);
+                let _has_listener = all_cast.iter().any(|c| !display_msgs.iter().any(|m| &m.nick == *c));
+                let torso_up = false; // FIX 110: no torso-up crop, always full body. Old: single-char panels used torso-up, causing shrunken/truncated/floating avatar.
+                let col_w = col_w_total; // FIX 110: same columns as balloons, so tails land on heads.
                 ui.horizontal_top(|ui| {
                     for (idx, msg) in display_msgs.iter().enumerate() {
                         // Pose-aware: emotion+gesture from the message, not largest DIB.
                         // Same (emotion, gesture) => same AVB pose, preview == panel.
                         // Do not hash nick+text: that made "you are" show Coy in preview
                         // and Happy in-panel for the same Neutral / PointOther.
-                        let tex = self.char_pose_texture_seeded(ctx, &msg.character, msg.emotion, msg.gesture, msg.neutral_variant);
+                        // Wire body is the exact image the sender chose (G010/G410/G810).
+                        // Use it directly so panel == wire == preview. Seeded cycle
+                        // only when the message has no wire body (local / analyze).
+                        let tex = if let Some(body) = msg.pose.as_ref().and_then(|p| p.body) {
+                            self.char_pose_texture_for_image(ctx, &msg.character, body as usize)
+                        } else {
+                            self.char_pose_texture_seeded(ctx, &msg.character, msg.emotion, msg.gesture, msg.neutral_variant)
+                        };
                         let nick = msg.nick.clone();
                         let in_cast = self.panel_cast.contains(&nick);
                         // Facing (PDF §4.3): AVB art faces RIGHT, so the
@@ -2803,7 +2894,7 @@ ui.vertical_centered(|ui| {
                         let flip = idx > 0;
                         ui.vertical_centered(|ui| {
                             ui.set_width(col_w);
-                            let avatar_resp = draw_character_box(ui, &msg.nick, &msg.character, msg.emotion, tex, if torso_up { char_slot_h } else { _char_h_est }, col_w, flip, self.cfg.comic.avatar_seed, torso_up);
+                            let avatar_resp = draw_character_box(ui, &msg.nick, &msg.character, msg.emotion, tex, char_slot_h, col_w, flip, self.cfg.comic.avatar_seed, false);
                             // Clicking avatar in frame = Include
                             if avatar_resp.clicked() {
                                 if in_cast { self.panel_cast.retain(|x| x != &nick); }
@@ -2825,7 +2916,7 @@ ui.vertical_centered(|ui| {
                             // face LEFT toward them (PDF §4.3).
                             ui.vertical_centered(|ui| {
                                 ui.set_width(col_w);
-                                let avatar_resp = draw_character_box(ui, cast_nick, &char_name, Emotion::Neutral, tex, _char_h_est, col_w, true, self.cfg.comic.avatar_seed, false);
+                                let avatar_resp = draw_character_box(ui, cast_nick, &char_name, Emotion::Neutral, tex, char_slot_h, col_w, true, self.cfg.comic.avatar_seed, false);
                                 if avatar_resp.clicked() {
                                     if self.panel_cast.contains(cast_nick) { self.panel_cast.retain(|x| x != cast_nick); }
                                     else { self.panel_cast.push(cast_nick.clone()); }
