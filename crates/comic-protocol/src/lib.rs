@@ -23,7 +23,6 @@
 //!   mapping. `irc_eq` implements it. Plain `eq_ignore_ascii_case` is WRONG
 //!   for nicks containing `{}` etc.
 //! * Flood control: the original throttled outgoing PRIVMSG to at most
-//!   1 per ~1s burst, with a queue. `FloodLimiter` encodes the rule:
 //!   allow burst of 3, then 1 per second. Do NOT send faster — servers
 //!   kick for flooding.
 //! * Slash commands (client-side, never sent raw): /join, /part, /nick,
@@ -167,22 +166,6 @@ pub fn parse_slash(line: &str) -> Option<SlashCommand> {
     })
 }
 
-/// Flood limiter: burst of 3, then 1 per second.
-/// `now_ms` is monotonic ms. `try_send` returns true if the message
-/// may be sent now; else the caller must queue it.
-#[derive(Debug, Clone)]
-pub struct FloodLimiter { pub burst: u32, pub per_ms: u64, pub sent: Vec<u64> }
-impl FloodLimiter {
-    pub fn new() -> Self { Self { burst: 3, per_ms: 1000, sent: Vec::new() } }
-    pub fn try_send(&mut self, now_ms: u64) -> bool {
-        self.sent.retain(|t| now_ms.saturating_sub(*t) < 5000);
-        if (self.sent.len() as u32) < self.burst { self.sent.push(now_ms); return true; }
-        if let Some(last) = self.sent.last() { if now_ms.saturating_sub(*last) >= self.per_ms { self.sent.push(now_ms); return true; } }
-        false
-    }
-}
-impl Default for FloodLimiter { fn default() -> Self { Self::new() } }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +176,5 @@ mod tests {
     #[test] fn slash_me() { assert_eq!(parse_slash("/me waves"), Some(SlashCommand::Me("waves".into()))); }
     #[test] fn slash_unknown() { assert!(matches!(parse_slash("/foo bar"), Some(SlashCommand::Unknown(_, _)))); }
     #[test] fn split_long() { let long = "word ".repeat(200); let chunks = split_privmsg("#chan", &long); assert!(chunks.len() > 1); for c in &chunks { assert!(c.len() <= 512); } }
-    #[test] fn flood() { let mut f = FloodLimiter::new(); assert!(f.try_send(0)); assert!(f.try_send(0)); assert!(f.try_send(0)); assert!(!f.try_send(0)); assert!(f.try_send(1000)); }
     #[test] fn nick_valid() { assert!(is_valid_nick("Alice_1")); assert!(!is_valid_nick("1Alice")); assert!(!is_valid_nick("a b")); }
 }

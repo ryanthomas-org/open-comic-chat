@@ -280,6 +280,8 @@ pub struct ServerState {
 }
 
 #[allow(dead_code)]
+pub(crate) fn default_panel_width() -> f32 { 320.0 }
+
 pub struct ComicChatApp {
     pub cfg: AppConfig,
     pub event_rx: mpsc::UnboundedReceiver<IrcEvent>,
@@ -353,6 +355,7 @@ pub struct ComicChatApp {
 }
 
 impl ComicChatApp {
+    pub fn panel_width(&self) -> f32 { self.cfg.comic.panel_width }
     pub fn new(cfg: AppConfig, event_tx: mpsc::UnboundedSender<IrcEvent>, event_rx: mpsc::UnboundedReceiver<IrcEvent>, handles: HandleMap, control_tx: mpsc::UnboundedSender<Control>) -> Self {
         let mut servers = HashMap::new();
         for s in &cfg.servers {
@@ -1453,7 +1456,7 @@ ch.title_pending = false;
         if self.cfg.ui.panels_per_row > 0 { return self.cfg.ui.panels_per_row; }
         // Fixed small panels: fit as many 320-wide panels as fit, never grow to fill row.
         // Old code capped at 3 and grew panel_w to fill, so panels resized large and spilled early.
-        let fixed = 320.0;
+        let fixed = self.cfg.comic.panel_width;
         let spacing = 8.0;
         let margin = 16.0;
         let n = ((avail_w - margin + spacing) / (fixed + spacing)).floor() as usize;
@@ -2245,7 +2248,7 @@ impl eframe::App for ComicChatApp {
         });
 
         // Right sidebar: Members + Selfview + Emotion wheel
-        egui::SidePanel::right("sidebar").default_width(260.0).show(ctx, |ui| {
+        egui::SidePanel::right("sidebar").default_width(260.0).resizable(true).min_width(0.0).resizable(true).min_width(0.0).show(ctx, |ui| {
             ui.heading("Members");
             let members: Vec<String> = self.servers.get(&self.active_server).and_then(|s| s.channels.get(&self.active_channel)).map(|c| c.members.clone()).unwrap_or_default();
             // Clone char_map for display
@@ -2559,10 +2562,10 @@ impl ComicChatApp {
         let total_w = ui.available_width();
         let _ = total_w;
         let _spacing = 8.0;
-        let normal_panel_w = 320.0; // Fixed small, never grow to fill row. per_row is computed from this width.
+        let normal_panel_w = self.cfg.comic.panel_width; // Fixed small, never grow to fill row. per_row is computed from this width.
         // Original: establishing shot is wide but SAME HEIGHT as normal.
         // total_w made the opening panel huge and broke row alignment.
-        let wide_panel_w = 320.0; // panel.cpp: no wide pane — establishing is same size, zoom 0.8 only
+        let wide_panel_w = self.cfg.comic.panel_width; // No 0.8 zoom: source has no wide-pane zoom.
         // Background texture (if BGB has PNG sidecar)
         let bg_tex = self.bg_texture(ctx, &bg_name);
         ScrollArea::vertical().scroll_bar_visibility(egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible).stick_to_bottom(true).show(ui, |ui| {

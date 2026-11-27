@@ -70,7 +70,7 @@ pub struct ComicMessage {
 pub struct Panel {
     pub messages: Vec<ComicMessage>,
     pub zoom: f32,
-    /// Establishing shot (PDF §6.2): about every 15th panel the camera
+    // 15th-panel zoom removed: source has no 0.8 zoom.
     /// pulls back to remind readers of the surroundings. Drawn full-width
     /// with a smaller zoom; the entry title card is the first one.
     pub establishing: bool,
@@ -336,8 +336,8 @@ pub fn group_into_panels(messages: &[ComicMessage], per_panel: usize) -> Vec<Pan
     let flush = |panels: &mut Vec<Panel>, msgs: &mut Vec<ComicMessage>, acts: &mut Vec<ComicMessage>, nicks: &mut Vec<String>| {
         if msgs.is_empty() && acts.is_empty() { return; }
         let n = msgs.len() + acts.len();
-        // PDF §6.2: about every 15th panel is an establishing shot — the
-        // camera pulls back (zoom 0.8) to remind readers of the surroundings.
+        // 15th-panel zoom removed: source has no 0.8 zoom.
+        // No 0.8 zoom: source has no wide-pane zoom.
         // Panel index is panels.len() (the panel being created). The title
         // card is panel 0, so idx > 0 keeps it from counting as one.
         let idx = panels.len();

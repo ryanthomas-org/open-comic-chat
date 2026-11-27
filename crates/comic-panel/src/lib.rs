@@ -53,7 +53,7 @@ pub struct PanelLayout {
     pub max_panel_height: f64,
 }
 impl Default for PanelLayout {
-    fn default() -> Self { Self { panel_width: 640.0, panel_gap: 8.0, entry_gap: 12.0, max_entries: 4, max_panel_height: 480.0 } }
+    fn default() -> Self { Self { panel_width: 640.0, panel_gap: 8.0, entry_gap: 12.0, max_entries: 5, max_panel_height: 480.0 } }
 }
 impl PanelLayout {
     /// Would adding `entry` to a panel that already holds `current`
@@ -69,7 +69,7 @@ impl PanelLayout {
 }
 
 /// Group a stream of entries into panels, in order.
-/// System entries (joins/parts) do NOT force a new panel on their own;
+/// Source rule: see should_break(). System entries (joins/parts) do NOT force a new panel on their own;
 /// they pack like any entry, except a join that starts a new cast
 /// member's first appearance may start a new panel if `break_on_join`
 /// is set (the original did this for the establishing shot only).
@@ -146,4 +146,14 @@ mod tests {
     #[test] fn title_card_only_first_frame() { assert!(should_show_title_card(true, false)); assert!(!should_show_title_card(true, true)); assert!(!should_show_title_card(false, false)); }
     #[test] fn cast_order_not_message_order() { let mut c = Cast::default(); c.join("bob", "Bob"); c.join("alice", "Alice"); let pos = c.avatar_positions(&vec!["alice".into(), "bob".into()], 640.0); assert_eq!(pos[0].0, "bob"); assert_eq!(pos[1].0, "alice"); }
     #[test] fn max_entries() { let l = PanelLayout { max_entries: 2, ..Default::default() }; let es = vec![entry("a", 10.0), entry("b", 10.0), entry("c", 10.0)]; assert_eq!(group_into_panels(&es, &l, false).len(), 2); }
+}
+
+/// Source panel-break rule (panel.cpp): break when elements >= 5,
+/// panels < 2, speaker already in last panel, or m_newPanel is set.
+/// Callers pass those four inputs; grouping uses this, not width alone.
+pub fn should_break(elements_in_current: usize, panels_so_far: usize, speaker_in_last: bool, m_new_panel: bool) -> bool {
+    if m_new_panel { return true; }
+    if elements_in_current >= 5 { return true; }
+    if panels_so_far < 2 && speaker_in_last { return true; }
+    false
 }

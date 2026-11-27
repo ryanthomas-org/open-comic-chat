@@ -267,10 +267,14 @@ fn default_font() -> String { "Comic Sans MS".to_string() }
 fn default_interface_font() -> String { "Comic Sans MS".to_string() }
 fn default_chat_font() -> String { "Comic Sans MS Bold".to_string() }
 
+pub(crate) fn default_panel_width() -> f32 { 320.0 }
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ComicConfig {
     pub messages_per_panel: usize,
     pub avatar_seed: u64,
+    #[serde(default = "default_panel_width")]
+    pub panel_width: f32,
     pub character: String,
     pub background: String,
     #[serde(default)]
@@ -345,7 +349,7 @@ impl Default for AppConfig {
                 name: "Libera".into(), host: "irc.libera.chat".into(), port: Some(6697), tls: true,
                 nick: None, channels: vec!["#libera".into()], sasl: None, autoconnect: true,
             }],
-            comic: ComicConfig { messages_per_panel: 3, avatar_seed: 7, character: "Frank".into(), background: "Cafe".into(), character_url: None, background_url: None, pose_style: "old".into(), auto_download: true, show_pose_codes_in_text: true, strip_pose_codes_in_comic: true, titles: Vec::new(), sound_path: default_sound_path(), ctcp_version: None },
+            comic: ComicConfig { messages_per_panel: 3, avatar_seed: 7, panel_width: 320.0, character: "Frank".into(), background: "Cafe".into(), character_url: None, background_url: None, pose_style: "old".into(), auto_download: true, show_pose_codes_in_text: true, strip_pose_codes_in_comic: true, titles: Vec::new(), sound_path: default_sound_path(), ctcp_version: None },
             debug_log: DebugLogConfig::default(),
             icons: HashMap::new(),
             path: default_config_path(),
@@ -519,6 +523,7 @@ pub fn load(path: &PathBuf) -> Result<AppConfig, Box<dyn std::error::Error>> {
         comic: ComicConfig {
             messages_per_panel: lua_usize(&comic_t, "messages_per_panel", 3).max(1),
             avatar_seed: comic_t.get::<i64>("avatar_seed").unwrap_or(7) as u64,
+            panel_width: 320.0,
             character: lua_str(&comic_t, "character", "Frank"),
             background: lua_str(&comic_t, "background", "Cafe"),
             character_url: comic_t.get::<String>("character_url").ok(),
