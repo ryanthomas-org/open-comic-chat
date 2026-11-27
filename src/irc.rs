@@ -211,7 +211,8 @@ pub async fn run_server(cfg: ServerConfig, me_nick: String, mut cmd_rx: mpsc::Un
                     }
                     Some(IrcCommand::Whisper { target, text, pose_code }) => {
                         crate::log::debug("irc", format!("OUT Whisper to {target} pose={pose_code:?} preview={:?} — private, not to channel", crate::log::preview(&text)));
-                        let wire = with_pose(&text, &pose_code);
+                        let pose_with_t = if pose_code.is_empty() { pose_code.clone() } else if pose_code.contains('T') { pose_code.clone() } else { format!("{pose_code}T{target}") };
+                        let wire = with_pose(&text, &pose_with_t);
                         send_line(&mut writer, &format!("PRIVMSG {target} :{wire}")).await;
                         // FIX: AppearsAs whisper is AppearsAs, not a whisper panel.
                         // Echo as AppearsAs/BackgroundAs so drain updates char_map only.
